@@ -1,0 +1,8 @@
+# WebSocket Server Configuration
+ws_host: "localhost"
+ws_port: 8765
+
+# Engine Configuration
+data_res: 1024
+gui_res: 512
+max_edges: 2000

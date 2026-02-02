@@ -1,0 +1,15 @@
+{
+  "name": "rhgh_websocket",
+  "version": "1.0.0",
+  "description": "",
+  "license": "ISC",
+  "author": "",
+  "type": "commonjs",
+  "main": "index.js",
+  "scripts": {
+    "start": "python ./src/main.py"
+  },
+  "dependencies": {
+    "ws": "^8.19.0"
+  }
+}
