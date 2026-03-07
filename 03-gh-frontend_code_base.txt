@@ -1,0 +1,1043 @@
+src/
+├─ __pycache__/
+│  ├─ engine_sdf.cpython-313.pyc
+│  └─ engine.cpython-313.pyc
+├─ client.py
+├─ engine_sdf_註解版.py
+├─ engine_sdf.py
+├─ engine_註解版.py
+├─ engine.py
+├─ grasshopper_client.py
+├─ main_註解版.py
+└─ main.py
+
+
+--------------------------------------------------------------------------------------------
+client.py
+import asyncio
+import websockets
+
+
+async def hello():
+    uri = "ws://localhost:8765"
+    async with websockets.connect(uri) as websocket:
+        name = input("Enter your name: ")
+        print(f"Client sending: {name}")
+        await websocket.send(name)
+
+        greeting = await websocket.recv()
+        print(f"Client received: {greeting}")
+
+
+if __name__ == "__main__":
+    # 執行一次性的 Echo 測試
+    asyncio.run(hello())
+
+--------------------------------------------------------------------------------------------
+engine.py
+import taichi as ti
+import numpy as np
+import asyncio
+
+@ti.data_oriented
+class ComputeEngine:
+    """
+    二元遮罩計算引擎 (Binary Mask Engine)
+    使用環繞數演算法 (Winding Number Algorithm) 產生多邊形的 2D 遮罩。
+    """
+    def __init__(self, data_res, gui_res, max_edges):
+        self.res = data_res  # 計算網格解析度
+        self.gui_res = gui_res  # GUI 顯示解析度
+        self.MAX_EDGES = max_edges # 最大邊緣數
+
+        # Taichi Fields
+        self.mask_field = ti.field(dtype=ti.f32, shape=(self.res, self.res))
+        self.canvas = ti.field(dtype=ti.f32, shape=(self.gui_res, self.gui_res))
+
+        # 邊緣數據儲存
+        self.edges = ti.Vector.field(2, dtype=ti.f32, shape=(self.MAX_EDGES, 2))
+        self.num_edges = ti.field(dtype=ti.i32, shape=())
+
+    @ti.kernel
+    def compute_mask_gpu(self):
+        """
+        [GPU] 使用環繞數演算法計算遮罩。
+        此方法能正確處理重疊多邊形的聯集。
+        """
+        for i, j in self.mask_field:
+            p = ti.Vector([i / self.res, j / self.res])
+            winding = 0
+
+            # 遍歷所有邊緣，計算環繞數
+            for e_idx in range(self.num_edges[None]):
+                v0, v1 = self.edges[e_idx, 0], self.edges[e_idx, 1]
+                
+                # 判斷水平射線是否與邊緣相交
+                is_upward = v0.y <= p.y < v1.y
+                is_downward = v1.y <= p.y < v0.y
+                
+                if is_upward or is_downward:
+                    # 計算交點 x 座標
+                    t = (p.y - v0.y) / (v1.y - v0.y)
+                    intersect_x = v0.x + t * (v1.x - v0.x)
+                    
+                    if p.x < intersect_x:
+                        if is_upward:
+                            winding += 1
+                        else:
+                            winding -= 1
+
+            # 環繞數不為 0 表示點在內部
+            self.mask_field[i, j] = 1.0 if winding != 0 else 0.0
+
+    def _ensure_ccw(self, poly):
+        """
+        [CPU] 確保多邊形頂點為逆時針 (CCW) 順序。
+        對環繞數演算法至關重要。
+        """
+        area = 0.0
+        for i in range(len(poly)):
+            j = (i + 1) % len(poly)
+            area += poly[i][0] * poly[j][1] - poly[j][0] * poly[i][1]
+        
+        if area < 0:
+            return poly[::-1]  # 順時針則反轉
+        return poly
+
+    def update_geometry(self, polygons_list, bounds):
+        """
+        [CPU] 更新幾何數據，並觸發 GPU 計算。
+        """
+        edge_data = []
+        for poly in polygons_list:
+            if len(poly) < 3:
+                continue
+
+            # 1. 確保多邊形方向一致
+            clean_poly = self._ensure_ccw(poly)
+
+            # 2. 建立邊緣列表
+            for i in range(len(clean_poly)):
+                p1 = clean_poly[i]
+                p2 = clean_poly[(i + 1) % len(clean_poly)]
+                edge_data.append([p1, p2])
+
+        if not edge_data:
+            self.num_edges[None] = 0
+            self.mask_field.fill(0)
+            self._upsample() # 更新畫布
+            return
+
+        # 3. 準備數據並傳輸至 GPU
+        count = min(len(edge_data), self.MAX_EDGES)
+        np_edges = np.zeros((self.MAX_EDGES, 2, 2), dtype=np.float32)
+        if count > 0:
+            np_edges[:count] = np.array(edge_data[:count], dtype=np.float32)
+
+        self.edges.from_numpy(np_edges)
+        self.num_edges[None] = count
+
+        # 4. 觸發 GPU 計算與畫布更新
+        self.compute_mask_gpu()
+        self._upsample()
+
+    @ti.kernel
+    def _upsample(self):
+        """
+        [GPU] 將低解析度的計算結果升採樣至高解析度的畫布。
+        """
+        for i, j in self.canvas:
+            self.canvas[i, j] = self.mask_field[
+                i * self.res // self.gui_res, j * self.res // self.gui_res
+            ]
+
+--------------------------------------------------------------------------------------------
+engine_sdf.py
+import taichi as ti
+import numpy as np
+
+# 注意：不要在這裡寫 ti.init()，它由 main.py 統一管理
+
+
+@ti.data_oriented
+class SDFEngine:
+    """
+    符號距離場計算引擎 (Signed Distance Field Engine)
+    計算 2D 多邊形的 SDF 並產生視覺化的等高線圖。
+    """
+
+    def __init__(self, data_res=256, gui_res=512, max_edges=2000):
+        self.res = data_res  # 計算網格解析度
+        self.gui_res = gui_res  # GUI 顯示解析度
+        self.MAX_EDGES = max_edges  # 最大邊緣數
+
+        # Taichi Fields
+        # 距離場
+        self.sdf_field = ti.field(dtype=ti.f32, shape=(self.res, self.res))
+        # 畫布 (RGB)
+        self.canvas = ti.Vector.field(
+            3, dtype=ti.f32, shape=(self.gui_res, self.gui_res)
+        )
+
+        # 邊緣數據儲存: shape=(邊數, 2個頂點) -> 每個元素是一個 Vector(2)
+        self.edges = ti.Vector.field(2, dtype=ti.f32, shape=(self.MAX_EDGES, 2))
+        self.num_edges = ti.field(dtype=ti.i32, shape=())
+
+    @ti.func
+    def dist_point_segment(self, p, v0, v1):
+        """
+        [GPU] 計算點到線段的最短距離。
+        修正: 移除了 if 內的 return，改用變數賦值。
+        """
+        result = 0.0
+
+        l2 = (v1 - v0).norm_sqr()
+
+        # 使用一個很小的數 (epsilon) 來避免浮點數比較誤差
+        if l2 < 1e-6:
+            # 如果線段長度為 0 (起點=終點)，直接算點到點距離
+            result = (p - v0).norm()
+        else:
+            # 投影 p 到線段 v0-v1 所在的直線上
+            t = (p - v0).dot(v1 - v0) / l2
+            t = ti.max(0.0, ti.min(1.0, t))  # 限制 t 在 [0, 1] 之間
+            projection = v0 + t * (v1 - v0)
+            result = (p - projection).norm()
+
+        return result
+
+    @ti.kernel
+    def compute_sdf_gpu(self):
+        """
+        [GPU] 計算符號距離場 (SDF)。
+        結合到最近邊緣的距離和環繞數來判斷內外。
+        """
+        for i, j in self.sdf_field:
+            p = ti.Vector([i / self.res, j / self.res])
+
+            min_dist = 1e9  # 初始化一個極大值
+            winding = 0
+
+            for k in range(self.num_edges[None]):
+                v0 = self.edges[k, 0]
+                v1 = self.edges[k, 1]
+
+                # 1. 計算到最近邊緣的距離
+                dist = self.dist_point_segment(p, v0, v1)
+                min_dist = ti.min(min_dist, dist)
+
+                # 2. 計算環繞數以判斷內外 (Point-in-Polygon)
+                # 這裡不需要 return，所以 if 邏輯是安全的
+                is_upward = (v0.y <= p.y) & (p.y < v1.y)
+                is_downward = (v1.y <= p.y) & (p.y < v0.y)
+
+                if is_upward or is_downward:
+                    # 計算射線與邊的交點 X 座標
+                    intersect_x = (v1.x - v0.x) * (p.y - v0.y) / (v1.y - v0.y) + v0.x
+                    if p.x < intersect_x:
+                        if is_upward:
+                            winding += 1
+                        else:
+                            winding -= 1
+
+            # 根據環繞數設定 SDF 值的符號 (內部為負，外部為正)
+            if winding != 0:
+                self.sdf_field[i, j] = -min_dist
+            else:
+                self.sdf_field[i, j] = min_dist
+
+    @ti.kernel
+    def render_isolines(self):
+        """[GPU] 將 SDF 渲染為視覺化的等高線圖。"""
+        for i, j in self.canvas:
+            # 座標映射：從 canvas 解析度映射回 data 解析度
+            data_i = i * self.res // self.gui_res
+            data_j = j * self.res // self.gui_res
+
+            sdf_val = self.sdf_field[data_i, data_j]
+
+            # 使用 sin 函數產生波紋效果 (頻率 150.0)
+            wave = ti.sin(sdf_val * 150.0)
+
+            color = ti.Vector([0.0, 0.0, 0.0])
+
+            # 根據內外選擇不同色調
+            if sdf_val < 0:  # 內部
+                # 藍色調 + 波紋
+                base = ti.Vector([0.1, 0.4, 0.8])
+                color = base * (0.6 + 0.4 * wave)
+            else:  # 外部
+                # 橘色調 + 距離衰減 + 波紋
+                attenuation = ti.exp(-sdf_val * 15.0)  # 距離越遠越暗
+                base = ti.Vector([1.0, 0.5, 0.2])
+                color = base * (0.5 + 0.5 * wave) * attenuation
+
+            # 繪製零等值線 (物體邊界)，白色
+            if abs(sdf_val) < 0.005:
+                color = ti.Vector([1.0, 1.0, 1.0])
+
+            self.canvas[i, j] = color
+
+    def update_geometry(self, polygons_list):
+        """
+        [CPU] 更新幾何數據，並觸發 GPU 計算與渲染。
+        """
+        edge_data = []
+        for poly in polygons_list:
+            if len(poly) < 3:
+                continue
+
+            # 計算多邊形面積 (Signed Area)
+            area = 0.0
+            for i in range(len(poly)):
+                j = (i + 1) % len(poly)
+                area += poly[i][0] * poly[j][1] - poly[j][0] * poly[i][1]
+
+            # 如果是順時針 (面積 < 0)，反轉為逆時針
+            # 確保 Union 運算正確
+            if area < 0:
+                poly = poly[::-1]
+
+            # 構建邊緣列表
+            for i in range(len(poly)):
+                p1 = poly[i]
+                p2 = poly[(i + 1) % len(poly)]
+                edge_data.append([p1, p2])
+
+        # 如果沒有數據，清空畫面
+        if not edge_data:
+            self.num_edges[None] = 0
+            self.sdf_field.fill(100.0)  # 設為外部
+            self.canvas.fill(0)
+            return
+
+        # 限制邊緣數量並轉換為 Numpy 格式
+        count = min(len(edge_data), self.MAX_EDGES)
+        np_edges = np.zeros((self.MAX_EDGES, 2, 2), dtype=np.float32)
+
+        if count > 0:
+            np_edges[:count] = np.array(edge_data[:count], dtype=np.float32)
+
+        # 傳輸數據到 GPU
+        self.edges.from_numpy(np_edges)
+        self.num_edges[None] = count
+
+        # 依序觸發 GPU 計算
+        self.compute_sdf_gpu()
+        self.render_isolines()
+
+--------------------------------------------------------------------------------------------
+engine_sdf_註解版.py
+# 匯入必要的函式庫
+import taichi as ti  # 用於 GPU 計算
+import numpy as np  # 用於數值計算和數據交換
+import asyncio      # 用於非同步程式設計 (在此檔案中未使用，但保留以保持一致性)
+
+# 注意：在此檔案中不呼叫 ti.init()。
+# 為了確保所有 Taichi 物件 (field, kernel) 都在同一個計算上下文中，
+# `ti.init()` 應該在主程式 (main.py) 中統一呼叫一次。
+
+# --- Taichi 資料導向類別 ---
+@ti.data_oriented
+class SDFEngine:
+    # --- 初始化函式 ---
+    def __init__(self, data_res=256, gui_res=512):
+        # --- 成員變數定義 ---
+        self.res = data_res          # SDF 計算網格的解析度
+        self.gui_res = gui_res        # GUI 顯示的解析度
+
+        # --- Taichi Field 定義 ---
+        # 建立一個 2D 浮點數 field，用於儲存每個網格點的符號距離值 (Signed Distance Field)
+        self.sdf_field = ti.field(dtype=ti.f32, shape=(self.res, self.res))
+        # 建立一個 2D 向量 field，用於儲存最終渲染出的彩色圖像
+        # ti.Vector.field(3, ...) 表示每個像素儲存一個 3 維向量 (R, G, B)
+        self.canvas = ti.Vector.field(3, dtype=ti.f32, shape=(self.gui_res, self.gui_res))
+
+        # --- 邊緣數據儲存 (與 ComputeEngine 相同) ---
+        self.MAX_EDGES = 2000  # 最大邊緣數
+        self.edges = ti.Vector.field(2, dtype=ti.f32, shape=(self.MAX_EDGES, 2)) # 儲存邊的兩個頂點
+        self.num_edges = ti.field(dtype=ti.i32, shape=()) # 儲存當前有效的邊數
+
+        # 此引擎不建立自己的 GUI，而是由主程式統一管理和渲染
+        self.is_running = True # 狀態旗標
+
+    # --- Taichi GPU 輔助函式 ---
+    # @ti.func 裝飾器表示這是一個可以在 ti.kernel 中被呼叫的輔助函式
+    # 它本身不會直接在 GPU 上啟動，而是會被內聯 (inline) 到呼叫它的核心函式中
+    @ti.func
+    def dist_point_segment(self, p, v0, v1):
+        """計算點 p 到線段 v0-v1 的最短距離 (在 GPU 上執行)"""
+        # 向量運算
+        pa = p - v0  # 從 v0 指向 p 的向量
+        ba = v1 - v0  # 從 v0 指向 v1 的向量 (線段本身)
+        # 計算 p 在 ba 上的投影長度比例 h
+        # h = (pa · ba) / |ba|^2
+        # ti.max(0.0, ti.min(1.0, ...)) 將 h 的值限制在 [0, 1] 範圍內
+        # 如果 h < 0，表示 p 的投影點在 v0 之外，離 p 最近的點是 v0
+        # 如果 h > 1，表示 p 的投影點在 v1 之外，離 p 最近的點是 v1
+        # 如果 0 <= h <= 1，表示投影點在線段上
+        h = ti.max(0.0, ti.min(1.0, pa.dot(ba) / ba.dot(ba)))
+        # 最短距離向量 = pa - ba * h
+        # .norm() 計算向量的長度 (L2 範數)
+        return (pa - ba * h).norm()
+
+    # --- Taichi GPU 核心函式 ---
+    @ti.kernel
+    def compute_sdf_gpu(self):
+        """
+        在 GPU 上並行計算每個像素的符號距離場 (SDF)。
+        SDF 的值代表該點到最近邊緣的距離，符號代表該點在圖形內部 (-) 或外部 (+)。
+        """
+        # 並行遍歷計算網格中的每一個像素 (i, j)
+        for i, j in self.sdf_field:
+            # 將像素索引轉換為 [0, 1] 範圍的標準化座標
+            p = ti.Vector([i / self.res, j / self.res])
+
+            min_dist = 1e9  # 初始化一個極大的距離值
+            winding = 0       # 初始化環繞數
+
+            # 遍歷所有有效的邊緣
+            for k in range(self.num_edges[None]):
+                v0 = self.edges[k, 0] # 邊的起點
+                v1 = self.edges[k, 1] # 邊的終點
+
+                # 1. 計算點 p 到目前這條邊的最短物理距離
+                d = self.dist_point_segment(p, v0, v1)
+                min_dist = ti.min(min_dist, d) # 更新全局最小距離
+
+                # 2. 同時計算環繞數 (Winding Number) 來判斷點的內外
+                if v0.y <= p.y < v1.y and p.x < (v1.x - v0.x) * (p.y - v0.y) / (v1.y - v0.y) + v0.x:
+                    winding += 1 # 向上穿越
+                elif v1.y <= p.y < v0.y and p.x < (v1.x - v0.x) * (p.y - v0.y) / (v1.y - v0.y) + v0.x:
+                    winding -= 1 # 向下穿越
+
+            # 根據環繞數決定距離的符號
+            if winding != 0:
+                # 如果環繞數不為 0，表示點在內部，距離為負
+                self.sdf_field[i, j] = -min_dist
+            else:
+                # 如果環繞數為 0，表示點在外部，距離為正
+                self.sdf_field[i, j] = min_dist
+
+    # --- Taichi GPU 核心函式 ---
+    @ti.kernel
+    def render_isolines(self):
+        """將計算好的 SDF 距離場渲染成漂亮的等高線視覺效果"""
+        # 並行遍歷顯示畫布上的每一個像素
+        for i, j in self.canvas:
+            # 透過最近鄰插值從 SDF 計算網格中取樣
+            sdf_val = self.sdf_field[i * self.res // self.gui_res, j * self.res // self.gui_res]
+
+            # 初始化顏色為黑色
+            color = ti.Vector([0.0, 0.0, 0.0])
+
+            # --- 視覺化邏輯 ---
+            # 使用 sin 函數根據 SDF 值產生波浪效果，形成等高線
+            # 頻率 150.0 決定了線條的密度
+            wave = ti.sin(sdf_val * 150.0)
+
+            if sdf_val < 0:  # 內部
+                # 基礎顏色為藍色調
+                base_blue = ti.Vector([0.1, 0.4, 0.8])
+                # 使用 wave 在基礎藍色和更亮的藍色之間過渡，產生波紋
+                color = base_blue * (0.8 + 0.2 * wave)
+            else:  # 外部
+                # 基礎顏色為橙色
+                base_orange = ti.Vector([1.0, 0.5, 0.2])
+                # 距離越遠，顏色越暗 (指數衰減)
+                dist_attenuation = ti.exp(-sdf_val * 10.0)
+                # 橙色波紋疊加衰減效果
+                color = base_orange * (0.5 + 0.5 * wave) * dist_attenuation
+
+            # 當 SDF 值非常接近 0 時，畫一條白色的邊界線
+            if ti.abs(sdf_val) < 0.005:
+                color = ti.Vector([1.0, 1.0, 1.0])
+
+            # 將最終計算出的顏色賦值給畫布像素
+            self.canvas[i, j] = color
+
+    # --- 更新幾何數據的函式 (CPU) ---
+    def update_geometry(self, polygons_list):
+        edge_data = [] # 暫存邊緣的 Python 列表
+        for poly in polygons_list:
+            if len(poly) < 3:
+                continue
+
+            # 同樣需要確保多邊形是逆時針方向，以保證 Winding Number 計算的正確性
+            area = 0.0
+            for i in range(len(poly)):
+                j = (i + 1) % len(poly)
+                area += poly[i][0] * poly[j][1] - poly[j][0] * poly[i][1]
+            if area < 0:
+                poly = poly[::-1] # 反轉
+
+            # 建立邊緣列表
+            for i in range(len(poly)):
+                p1 = poly[i]
+                p2 = poly[(i + 1) % len(poly)]
+                edge_data.append([p1, p2])
+
+        # 如果沒有邊緣數據，直接返回
+        if not edge_data:
+            # (可以選擇在這裡清空 sdf_field 和 canvas)
+            self.num_edges[None] = 0
+            self.sdf_field.fill(1e9) # 用一個很大的正數填充，表示全都是外部
+            self.render_isolines()
+            return
+
+        # --- 數據傳輸到 GPU ---
+        count = min(len(edge_data), self.MAX_EDGES) # 確保不超過最大邊緣數
+        np_edges = np.zeros((self.MAX_EDGES, 2, 2), dtype=np.float32)
+        np_edges[:count] = np.array(edge_data[:count], dtype=np.float32)
+
+        self.edges.from_numpy(np_edges)
+        self.num_edges[None] = count
+
+        # --- 觸發 GPU 計算和渲染 ---
+        # 依序呼叫核心函式
+        self.compute_sdf_gpu()   # 第一步：計算 SDF
+        self.render_isolines() # 第二步：根據 SDF 結果渲染視覺效果
+
+--------------------------------------------------------------------------------------------
+engine_註解版.py
+# 匯入必要的函式庫
+import taichi as ti  # 用於 GPU 計算
+import numpy as np  # 用於數值計算，特別是與 Taichi 進行數據交換
+import asyncio  # 用於非同步操作 (在此檔案的 run_loop 中使用)
+
+# --- Taichi 資料導向類別 ---
+# @ti.data_oriented 裝飾器告訴 Taichi 這是一個資料導向的類別
+# 這使得類別中的 `ti.kernel` 和 `ti.func` 可以存取類別成員 (例如 self.mask_field)
+@ti.data_oriented
+class ComputeEngine:
+    # --- 初始化函式 ---
+    # 在建立 ComputeEngine 物件時會被呼叫
+    def __init__(self, data_res=256, gui_res=512):
+        # --- 成員變數定義 ---
+        self.res = data_res  # 計算網格的解析度 (例如 256x256)
+        self.gui_res = gui_res  # GUI 視窗的解析度 (例如 512x512)
+
+        # --- Taichi Field 定義 ---
+        # Field 是 Taichi 中用於儲存數據的容器，它會被分配在指定的計算後端 (例如 GPU) 的記憶體中
+        # 建立一個 2D 的浮點數 field，用於儲存每個像素是否在多邊形內部的遮罩值 (0 或 1)
+        self.mask_field = ti.field(dtype=ti.f32, shape=(self.res, self.res))
+        # 建立一個 2D 的浮點數 field，用於最終在 GUI 上顯示的畫布
+        self.canvas = ti.field(dtype=ti.f32, shape=(self.gui_res, self.gui_res))
+
+        # --- 邊緣數據儲存 ---
+        self.MAX_EDGES = 2000  # 設定一個靜態的最大邊緣數量，以預先分配記憶體
+        # 建立一個 2D 向量 field 來儲存所有多邊形的邊緣
+        # shape=(self.MAX_EDGES, 2) 表示有 MAX_EDGES 條邊，每條邊有 2 個頂點
+        # ti.Vector.field(2, ...) 表示每個頂點是一個 2D 向量 (x, y)
+        self.edges = ti.Vector.field(2, dtype=ti.f32, shape=(self.MAX_EDGES, 2))
+        # 建立一個 0D 的整數 field 來儲存目前有效的邊緣數量
+        # shape=() 表示這是一個純量 (scalar)
+        self.num_edges = ti.field(dtype=ti.i32, shape=())
+
+        # --- GUI 和狀態 ---
+        # 建立一個獨立的 GUI 視窗 (雖然在主程式中統一管理，但此處展示了引擎也可以有自己的視窗)
+        self.gui = ti.GUI("GPU SDF Union Mode", res=self.gui_res)
+        self.is_running = True  # 控制渲染迴圈的狀態
+
+    # --- Taichi GPU 核心函式 ---
+    # @ti.kernel 裝飾器表示這個函式將會在 GPU 上並行執行
+    @ti.kernel
+    def compute_mask_gpu(self):
+        """
+        改進版：使用 Winding Number (環繞數) 算法在 GPU 上計算遮罩
+        這個算法可以正確處理多個重疊多邊形的聯集 (Boolean Union)，
+        避免了簡單奇偶規則在重疊處會產生空洞的問題。
+        """
+        # `for i, j in self.mask_field:` 是一個並行迴圈
+        # Taichi 會自動將這個迴圈的每一次迭代分配給一個 GPU 核心去執行
+        for i, j in self.mask_field:
+            # 將像素的整數索引 (i, j) 轉換為標準化的浮點數座標 (p)，範圍在 [0, 1] 之間
+            p = ti.Vector([i / self.res, j / self.res])
+
+            # 初始化環繞數計數器為 0
+            winding = 0
+
+            # 遍歷目前所有的有效邊緣
+            for e_idx in range(self.num_edges[None]):
+                # 取得邊緣的兩個頂點 v0 和 v1
+                # self.num_edges[None] 是讀取 0D field `num_edges` 的值
+                v0 = self.edges[e_idx, 0]
+                v1 = self.edges[e_idx, 1]
+
+                # --- Winding Number 算法核心 ---
+                # 從點 p 向右發射一條水平射線，計算這條射線與邊緣的相交情況
+                # 判斷射線是否在邊緣的 Y 軸範圍內
+                if v0.y <= p.y < v1.y:  # 邊緣是向上穿越射線 (Upward crossing)
+                    # 計算射線與邊緣的交點的 X 座標
+                    # 如果交點在點 p 的右邊 (即點 p 在交點的左邊)，表示射線與邊緣相交
+                    if p.x < (v1.x - v0.x) * (p.y - v0.y) / (v1.y - v0.y) + v0.x:
+                        winding += 1  # 環繞數加 1
+                elif v1.y <= p.y < v0.y:  # 邊緣是向下穿越射線 (Downward crossing)
+                    if p.x < (v1.x - v0.x) * (p.y - v0.y) / (v1.y - v0.y) + v0.x:
+                        winding -= 1  # 環繞數減 1
+
+            # 檢查最終的環繞數
+            # 如果環繞數不為 0，表示點 p 在多邊形內部
+            # 如果為 0，表示點 p 在外部
+            self.mask_field[i, j] = 1.0 if winding != 0 else 0.0
+
+    # --- Python CPU 函式 ---
+    def _ensure_ccw(self, poly):
+        """
+        強制多邊形頂點為逆時針方向 (Counter-Clockwise, CCW)。
+        原理：計算多邊形的帶符號面積 (Signed Area)。
+        如果面積為負，表示頂點是順時針排列，則將頂點列表反轉。
+        這對於 Winding Number 算法至關重要，因為它依賴於邊緣方向的一致性來實現聯集。
+        """
+        area = 0.0
+        num_verts = len(poly)
+        for i in range(num_verts):
+            j = (i + 1) % num_verts  # 下一個頂點的索引
+            area += poly[i][0] * poly[j][1]
+            area -= poly[j][0] * poly[i][1]
+
+        # 面積乘以 0.5 才是真實面積，但這裡我們只需要判斷正負
+        if area < 0:
+            return poly[::-1]  # 反轉列表
+        return poly
+
+    # --- 更新幾何數據的函式 ---
+    # 這個函式在 CPU 上執行，準備好數據後傳輸到 GPU
+    def update_geometry(self, polygons_list, bounds):
+        edge_data = []  # 建立一個 Python 列表來暫存所有邊緣
+
+        # 遍歷從客戶端傳來的所有多邊形
+        for poly in polygons_list:
+            if len(poly) < 3:
+                continue  # 一個有效的多邊形至少需要 3 個頂點
+
+            # 1. 強制所有多邊形都為逆時針方向 (關鍵步驟!)
+            # 這樣可以確保當兩個多邊形重疊時，它們的環繞數是相加 (1+1=2)，而不是相互抵消 (1-1=0)。
+            clean_poly = self._ensure_ccw(poly)
+
+            # 2. 從多邊形的頂點構建邊緣列表
+            num_verts = len(clean_poly)
+            for i in range(num_verts):
+                p1 = clean_poly[i]  # 當前頂點
+                p2 = clean_poly[(i + 1) % num_verts]  # 下一個頂點 (最後一個頂點連回第一個)
+                edge_data.append([p1, p2])  # 將這條邊加入列表
+
+        # 如果沒有任何邊緣數據 (例如傳入空列表)，則清空畫布
+        if not edge_data:
+            self.num_edges[None] = 0
+            self.mask_field.fill(0)  # 將遮罩 field 全部填為 0
+            # 即使沒有邊緣，也需要呼叫一次 GPU 函式來更新畫布狀態
+            self.compute_mask_gpu()
+            return
+
+        # 檢查邊緣數量是否超過預先分配的最大值
+        current_count = len(edge_data)
+        if current_count > self.MAX_EDGES:
+            print(f"警告: 邊緣數量 {current_count} 超出最大值，將被截斷。")
+            edge_data = edge_data[:self.MAX_EDGES]  # 截斷列表
+            current_count = self.MAX_EDGES
+
+        # 3. 準備數據並傳輸到 GPU
+        # 建立一個符合 Taichi Field 形狀的 NumPy 陣列
+        np_edges = np.zeros((self.MAX_EDGES, 2, 2), dtype=np.float32)
+        # 將 Python 列表轉換為 NumPy 陣列並填入
+        np_edges[:current_count] = np.array(edge_data, dtype=np.float32)
+
+        # 使用 from_numpy() 將 CPU 上的 NumPy 陣列數據一次性傳輸到 GPU 上的 Taichi Field
+        self.edges.from_numpy(np_edges)
+        # 更新有效的邊緣數量
+        self.num_edges[None] = current_count
+
+        # 呼叫 GPU 核心函式，觸發計算
+        self.compute_mask_gpu()
+
+    # --- Taichi GPU 核心函式 ---
+    @ti.kernel
+    def _upsample(self):
+        """
+        升採樣函式：將低解析度的計算結果 (mask_field) 放大到高解析度的畫布 (canvas) 上。
+        這是一種效能優化技巧：用較低解析度進行昂貴的計算，然後用較高解析度進行顯示。
+        """
+        # 並行遍歷高解析度的畫布
+        for i, j in self.canvas:
+            # 透過整數除法，找到 canvas 上的像素 (i, j) 對應到 mask_field 中的哪個像素
+            # 這樣可以實現最近鄰插值 (Nearest-neighbor interpolation)
+            self.canvas[i, j] = self.mask_field[
+                i * self.res // self.gui_res, j * self.res // self.gui_res
+            ]
+
+    # --- 非同步渲染迴圈 (範例) ---
+    async def run_loop(self):
+        # 這個迴圈主要用於獨立測試此引擎
+        while self.is_running and self.gui.running:
+            self._upsample()  # 更新畫布
+            self.gui.set_image(self.canvas)  # 將畫布設定到 GUI
+            self.gui.show()  # 顯示
+            await asyncio.sleep(0.01)  # 非同步等待
+
+--------------------------------------------------------------------------------------------
+grasshopper_client.py
+# run in grasshopper ghpython script component
+# r: websocket-client
+import websocket
+import scriptcontext as sc
+import json
+import Rhino.Geometry as rg
+
+
+# --- 幾何數據預處理 (不變) ---
+def get_payload(tree, bbox_rect):
+    if not bbox_rect:
+        return None
+    bbox = bbox_rect.GetBoundingBox(True)
+    min_p, max_p = bbox.Min, bbox.Max
+    width, height = max_p.X - min_p.X, max_p.Y - min_p.Y
+
+    all_polygons = []
+    for i in range(tree.BranchCount):
+        branch = tree.Branch(i)
+        for poly_geo in branch:
+            success, polyline = poly_geo.TryGetPolyline()
+            if not success:
+                temp_pc = poly_geo.ToPolyline(0.1, 0, 0.1, 0)
+                if temp_pc:
+                    polyline = temp_pc.ToPolyline()
+                else:
+                    continue
+
+            current_poly_pts = [
+                [(pt.X - min_p.X) / width, (pt.Y - min_p.Y) / height] for pt in polyline
+            ]
+            all_polygons.append(current_poly_pts)
+
+    return json.dumps({"polygons": all_polygons, "bounds": {"aspect": width / height}})
+
+
+# --- 同步連線與發送邏輯 ---
+
+url = "ws://localhost:8765"
+
+if run:
+    try:
+        # 1. 取得或建立連線
+        ws = sc.sticky.get("sync_ws")
+
+        # 檢查連線是否還活著，如果關閉了就重連
+        if ws is None or not ws.connected:
+            # 使用完整路徑呼叫
+            ws = websocket.create_connection(url, timeout=0.5)
+            sc.sticky["sync_ws"] = ws
+            status = "Connected (Sync)"
+        else:
+            status = "Sending..."
+
+        # 2. 準備並發送
+        payload_str = get_payload(polyline_tree, boundary)
+        if payload_str:
+            ws.send(payload_str)
+
+    except Exception as e:
+        status = f"Connect Error: {e}"
+        # 出錯時清除連線，下次重試
+        if "sync_ws" in sc.sticky:
+            try:
+                sc.sticky["sync_ws"].close()
+            except:
+                pass
+            del sc.sticky["sync_ws"]
+else:
+    if "sync_ws" in sc.sticky:
+        try:
+            sc.sticky["sync_ws"].close()
+        except:
+            pass
+        del sc.sticky["sync_ws"]
+    status = "Off"
+
+a = f"Status: {status}"
+
+--------------------------------------------------------------------------------------------
+main.py
+# 匯入必要套件
+import taichi as ti
+import asyncio
+import websockets
+import json
+import logging
+import numpy as np
+import yaml
+
+# --- 1. 讀取設定檔 ---
+with open("config.yaml", "r") as f:
+    config = yaml.safe_load(f)
+
+# --- 2. 初始化 Taichi ---
+ti.init(arch=ti.gpu)
+
+# --- 3. 匯入自定義引擎 ---
+from engine import ComputeEngine
+from engine_sdf import SDFEngine
+
+# --- 4. 設定日誌 ---
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
+)
+logger = logging.getLogger("RhinoBridge")
+
+# --- 5. 初始化計算引擎 ---
+engine_config = {
+    "data_res": config["data_res"],
+    "gui_res": config["gui_res"],
+    "max_edges": config["max_edges"],
+}
+engine_mask = ComputeEngine(**engine_config)
+engine_sdf = SDFEngine(**engine_config)
+
+# 建立統一的 GUI 視窗
+gui = ti.GUI("Rhino Taichi Bridge", res=config["gui_res"])
+
+# --- 6. 全域狀態 ---
+current_mode = "sdf"  # 預設模式
+latest_polygons = []  # 快取最新的幾何數據
+
+
+async def ws_handler(websocket):
+    """處理 WebSocket 連線和訊息的非同步函式"""
+    global current_mode, latest_polygons
+    logger.info("客戶端已連線")
+
+    try:
+        # 持續接收客戶端訊息
+        async for message in websocket:
+            try:
+                data = json.loads(message)
+
+                # 標記是否需要刷新引擎
+                need_update = False
+
+                # 1. 處理幾何數據更新 (更新快取)
+                if "polygons" in data:
+                    latest_polygons = data["polygons"]
+                    need_update = True
+
+                # 2. 處理模式切換
+                if "mode" in data:
+                    new_mode = data["mode"]
+                    if new_mode != current_mode:
+                        logger.info(f"切換模式: {current_mode} -> {new_mode}")
+                        current_mode = new_mode
+                        # 模式改變時，必須強制刷新，讓新引擎計算現有幾何
+                        need_update = True
+
+                # 3. 統一執行引擎更新
+                # 只要有收到多邊形 OR 切換了模式，且快取中有數據，就執行計算
+                if need_update and latest_polygons:
+                    if current_mode == "sdf":
+                        engine_sdf.update_geometry(latest_polygons)
+                    else:
+                        engine_mask.update_geometry(latest_polygons, {})
+
+                # 回傳狀態確認
+                await websocket.send(json.dumps({"status": "ok", "mode": current_mode}))
+
+            except Exception as e:
+                logger.error(f"處理訊息時發生錯誤: {e}")
+
+    except websockets.exceptions.ConnectionClosed:
+        logger.info("客戶端已斷線")
+
+
+async def render_loop():
+    """統一的渲染迴圈，負責更新 GUI 視窗"""
+    global current_mode
+    while gui.running:
+        # 根據模式選擇要顯示的畫布
+        if current_mode == "sdf":
+            gui.set_image(engine_sdf.canvas)
+            gui.text(
+                "Mode: SDF (Signed Distance Field)",
+                pos=(0.05, 0.95),
+                color=0xFFFFFF,
+                font_size=20,
+            )
+        else:
+            gui.set_image(engine_mask.canvas)
+            gui.text(
+                "Mode: Binary Mask (Union)",
+                pos=(0.05, 0.95),
+                color=0xFFFFFF,
+                font_size=20,
+            )
+
+        gui.show()
+        await asyncio.sleep(0.01)
+
+
+async def main():
+    """主函式，啟動伺服器和渲染迴圈"""
+    ws_host = config["ws_host"]
+    ws_port = config["ws_port"]
+
+    server = await websockets.serve(ws_handler, ws_host, ws_port)
+    logger.info(f"伺服器已啟動於 ws://{ws_host}:{ws_port}")
+
+    await render_loop()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
+
+--------------------------------------------------------------------------------------------
+main_註解版.py
+# 匯入必要的函式庫
+import taichi as ti  # 用於 GPU 計算和 GUI
+import asyncio  # 用於非同步 I/O，處理並行的網路和渲染
+import websockets  # 用於建立 WebSocket 伺服器
+import json  # 用於解析客戶端傳來的 JSON 訊息
+import logging  # 用於記錄伺服器狀態和錯誤
+import time  # 時間相關功能 (此處未使用)
+import numpy as np  # 用於數值計算 (主要用於和 Taichi 交換數據)
+
+# --- 1. 統一初始化 Taichi ---
+# ti.init() 是 Taichi 的啟動點，必須在使用任何 Taichi 功能前呼叫
+# arch=ti.gpu 指定計算後端為 GPU (例如 CUDA 或 Vulkan)，以獲得最佳效能
+ti.init(arch=ti.gpu)
+
+# 從其他檔案匯入我們自定義的計算引擎
+from engine import ComputeEngine  # 匯入原始的二元遮罩 (Mask) 引擎
+from engine_sdf import SDFEngine  # 匯入新的符號距離場 (SDF) 引擎
+
+# --- 設定日誌記錄 ---
+# basicConfig 用於設定日誌的基本格式
+logging.basicConfig(
+    level=logging.INFO,  # 設定日誌級別為 INFO，表示只記錄 INFO, WARNING, ERROR, CRITICAL 等級的訊息
+    format="%(asctime)s [%(levelname)s] %(message)s"  # 設定日誌訊息的格式，包含時間、級別和訊息內容
+)
+# 建立一個名為 "RhinoBridge" 的日誌記錄器
+logger = logging.getLogger("RhinoBridge")
+
+# --- 初始化兩個引擎 ---
+# 注意：這兩個引擎會共享同一個由 ti.init() 建立的 Taichi "Context"。
+# 這表示它們可以在同一個 GPU 上運作，而不需要重新初始化。
+engine_mask = ComputeEngine(data_res=1024, gui_res=512)  # 建立遮罩引擎的實例，設定計算解析度和顯示解析度
+engine_sdf = SDFEngine(data_res=1024, gui_res=512)  # 建立 SDF 引擎的實例
+
+# --- 建立一個統一的 GUI 視窗 ---
+# ti.GUI() 建立一個 Taichi 的圖形使用者介面視窗
+# "Rhino Taichi Bridge" 是視窗的標題
+# res=512 設定視窗的解析度為 512x512 像素
+gui = ti.GUI("Rhino Taichi Bridge", res=512)
+
+# --- 全域狀態變數 ---
+# 用於在不同的非同步函式之間共享狀態
+current_mode = "sdf"  # 預設模式為 'sdf'。可以是 'mask' 或 'sdf'
+latest_polygons = []  # 用於儲存從客戶端收到的最新多邊形幾何數據
+
+
+# --- WebSocket 訊息處理函式 ---
+# 當有客戶端連線時，這個非同步函式會被呼叫
+async def ws_handler(websocket):
+    # 使用 global 關鍵字來修改全域變數
+    global current_mode, latest_polygons
+    logger.info("客戶端已連線")
+
+    try:
+        # 使用 async for 迴圈來持續等待並接收來自客戶端的訊息
+        async for message in websocket:
+            try:
+                # 將收到的 JSON 字串訊息解析成 Python 的字典
+                data = json.loads(message)
+
+                # 1. 檢查訊息中是否包含 'mode' 鍵，用於切換計算模式
+                if "mode" in data:
+                    new_mode = data["mode"]  # 取得新的模式字串
+                    if new_mode != current_mode:  # 如果新模式和當前模式不同
+                        logger.info(f"切換模式: {current_mode} -> {new_mode}")
+                        current_mode = new_mode  # 更新全域的模式狀態
+
+                # 2. 檢查訊息中是否包含 'polygons' 鍵，用於更新幾何數據
+                if "polygons" in data:
+                    polygons = data["polygons"]  # 取得多邊形列表
+                    latest_polygons = polygons  # 更新全域的幾何數據快取
+
+                    # 3. 根據當前的模式，將幾何數據分派給對應的引擎進行計算
+                    if current_mode == "sdf":
+                        engine_sdf.update_geometry(polygons)  # 呼叫 SDF 引擎的更新函式
+                    else:
+                        engine_mask.update_geometry(polygons, {})  # 呼叫遮罩引擎的更新函式
+
+                # 向客戶端回傳一個確認訊息，告知目前狀態和模式
+                await websocket.send(json.dumps({"status": "ok", "mode": current_mode}))
+
+            except Exception as e:
+                # 如果在處理單一訊息時發生錯誤，記錄錯誤但保持連線
+                logger.error(f"處理訊息時發生錯誤: {e}")
+
+    except websockets.exceptions.ConnectionClosed:
+        # 如果客戶端斷開連線，記錄訊息
+        logger.info("客戶端已斷線")
+
+
+# --- 圖形渲染迴圈 ---
+async def render_loop():
+    """統一的渲染循環，負責將計算結果畫在 GUI 視窗上"""
+    global current_mode
+    # 當 GUI 視窗沒有被關閉時，持續執行
+    while gui.running:
+        # 根據當前的模式決定要渲染哪個引擎的畫布
+        if current_mode == "sdf":
+            # 從 SDF 引擎取得渲染好的畫布 (一個 Taichi field)
+            gui.set_image(engine_sdf.canvas)
+            # 在 GUI 視窗的左上角顯示目前的模式文字
+            gui.text(
+                "模式: SDF (符號距離場)",
+                pos=(0.05, 0.95),  # 位置 (x, y)，範圍是 0.0 到 1.0
+                color=0xFFFFFF,  # 顏色 (白色)
+                font_size=20,  # 字體大小
+            )
+        else:
+            # 從遮罩引擎取得渲染好的畫布
+            gui.set_image(engine_mask.canvas)
+            # 在 GUI 視窗上顯示模式文字
+            gui.text(
+                "模式: 二元遮罩 (聯集)",
+                pos=(0.05, 0.95),
+                color=0xFFFFFF,
+                font_size=20,
+            )
+
+        # 將畫布內容顯示在視窗上
+        gui.show()
+        # 等待一小段時間 (0.01秒)，釋放 CPU 資源，並讓其他非同步任務有機會執行
+        await asyncio.sleep(0.01)
+
+
+# --- 主函式 ---
+async def main():
+    # 建立並啟動 WebSocket 伺服器
+    # websockets.serve() 會回傳一個伺服器物件
+    # ws_handler 是處理每個連線的函式
+    # "localhost" 和 8765 是伺服器的位址和埠號
+    server = await websockets.serve(ws_handler, "localhost", 8765)
+    logger.info("伺服器已啟動於 ws://localhost:8765")
+
+    # 並行執行渲染迴圈
+    # 這裡 `await` 會等待 render_loop 結束，也就是 GUI 視窗被關閉
+    await render_loop()
+
+
+# --- 程式進入點 ---
+# 這是 Python 腳本的標準啟動方式
+if __name__ == "__main__":
+    try:
+        # asyncio.run() 是啟動非同步程式的進入點
+        # 它會執行傳入的 main() 函式，並管理整個事件迴圈
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        # 如果使用者按下 Ctrl+C，程式會在這裡捕捉到 KeyboardInterrupt 異常
+        # pass 表示什麼都不做，讓程式乾淨地退出
+        pass
+

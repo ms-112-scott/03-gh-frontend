@@ -1,2 +1,27 @@
+# --- Python 通用設定 ---
+__pycache__/
+*.py[cod]
 .venv/
+venv/
+.vscode/
+.idea/
+.DS_Store
+
+# --- Rhino / Grasshopper 專用 ---
+# 備份檔案
+*.3dmbak
+*.rhl
+*.ghbak
+*.gh~
 RHGH/
+
+# 自動存檔資料夾
+autosave/
+
+# --- 匯入的模型 ---
+# 如果你從 NCA 複製模型過來測試，不要 Commit 進去
+assets/models/*.pth
+assets/models/*.onnx
+
+# 但保留範例圖片 (如果有寫 README 的話)
+!assets/images/

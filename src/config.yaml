@@ -1,0 +1,20 @@
+# config.yaml  (NCA 版)
+# 在原有欄位基礎上新增 nca_* 區段
+
+# ── 幾何引擎 ─────────────────────────────────────────────────
+data_res: 64 # NCA 計算解析度（需與訓練時 patch_size 一致）
+gui_res: 512 # GUI 顯示解析度
+max_edges: 2000
+
+# ── WebSocket 伺服器 ──────────────────────────────────────────
+ws_host: "localhost"
+ws_port: 8765
+
+# ── NCA 推論設定 ──────────────────────────────────────────────
+# checkpoint 路徑：相對於 03-gh-frontend/src/ 的路徑
+# 或直接填絕對路徑
+nca_checkpoint: "C:/Users/GAI/Desktop/NCA_workspace/02-nca-cfd/train_log/LBMInspiredNCA/0307_5/nca_model_final_0307_1505.pth"
+
+# 每個渲染幀推進幾步 NCA（越高越快達到穩態，但 GPU 負載越重）
+# 建議範圍：1（互動即時）~ 16（快速預覽穩態）
+nca_steps_per_frame: 1
