@@ -1,19 +1,24 @@
-src/
-├─ __pycache__/
-│  ├─ engine_nca.cpython-313.pyc
-│  ├─ engine_sdf.cpython-313.pyc
-│  └─ engine.cpython-313.pyc
-├─ client.py
-├─ engine_nca.py
-├─ engine_sdf.py
-├─ engine.py
-├─ grasshopper_client.py
-├─ main.py
-├─ nca_loader.py
-└─ physics_colorizer.py
-
+code folder structure...
 --------------------------------------------------------------------------------------------
-client.py
+03-gh-frontend/
+├─ src/
+│  ├─ client.py
+│  ├─ cv2_test.py
+│  ├─ engine.py
+│  ├─ engine_nca.py
+│  ├─ engine_sdf.py
+│  ├─ grasshopper_client.py
+│  ├─ main.py
+│  ├─ nca_loader.py
+│  └─ physics_colorizer.py
+├─ .gitignore
+├─ GEMINI.md
+└─ config.yaml
+
+
+code base
+--------------------------------------------------------------------------------------------
+src\client.py
 import asyncio
 import websockets
 
@@ -34,7 +39,36 @@ if __name__ == "__main__":
     asyncio.run(hello())
 
 --------------------------------------------------------------------------------------------
-engine.py
+src\cv2_test.py
+import cv2
+
+import numpy as np
+from typing import Optional
+
+
+def check_opencv_env() -> None:
+    """
+    驗證 OpenCV 環境配置與版本資訊。
+    """
+    # 取得版本資訊
+    version: str = cv2.__version__
+    print(f"OpenCV version: {version}")
+
+    # 建立一個測試矩陣 (Black Image)
+    # 使用 Type Hint 確保與 NumPy 的相容性
+    test_img: np.ndarray = np.zeros((100, 100, 3), dtype=np.uint8)
+
+    # 測試基本的繪圖功能
+    cv2.circle(test_img, (50, 50), 20, (255, 255, 255), -1)
+
+    print("OpenCV 環境驗證成功。")
+
+
+if __name__ == "__main__":
+    check_opencv_env()
+
+--------------------------------------------------------------------------------------------
+src\engine.py
 import taichi as ti
 import numpy as np
 import asyncio
@@ -152,7 +186,7 @@ class ComputeEngine:
             ]
 
 --------------------------------------------------------------------------------------------
-engine_nca.py
+src\engine_nca.py
 """
 engine_nca.py  (視覺化升級版)
 NCA 推論 + 多模式物理場後處理 + Taichi 渲染。
@@ -169,7 +203,7 @@ NCA 推論 + 多模式物理場後處理 + Taichi 渲染。
 import base64
 import logging
 
-import cv2
+import cv2_test
 import numpy as np
 import taichi as ti
 import torch
@@ -309,7 +343,9 @@ class NCAEngine:
         """編碼為 JPEG base64，供 WebSocket 回傳給 GH。"""
         rgb_u8 = (self._rgb_np * 255).clip(0, 255).astype(np.uint8)
         bgr = rgb_u8[..., ::-1]
-        ok, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, quality])
+        ok, buf = cv2_test.imencode(
+            ".jpg", bgr, [cv2_test.IMWRITE_JPEG_QUALITY, quality]
+        )
         return base64.b64encode(buf.tobytes()).decode("ascii") if ok else ""
 
     def get_velocity_stats(self) -> dict:
@@ -390,7 +426,7 @@ def _ms_to_beaufort(speed_ms: float) -> int:
     return 12
 
 --------------------------------------------------------------------------------------------
-engine_sdf.py
+src\engine_sdf.py
 import taichi as ti
 import numpy as np
 
@@ -565,7 +601,7 @@ class SDFEngine:
         self.render_isolines()
 
 --------------------------------------------------------------------------------------------
-grasshopper_client.py
+src\grasshopper_client.py
 # grasshopper_client.py  (視覺化切換版)
 # Run in Grasshopper GHPython component
 #
@@ -725,7 +761,7 @@ b = vel_stats
 c = legend_out
 
 --------------------------------------------------------------------------------------------
-main.py
+src\main.py
 # main.py  (視覺化升級版)
 # 在原有 mask / sdf / nca 模式基礎上，新增 viz_mode 切換
 #
@@ -744,7 +780,7 @@ import yaml
 
 # ── 1. 讀取設定檔 ─────────────────────────────────────────────────────────
 path = "C:/Users/GAI/Desktop/NCA_workspace/03-gh-frontend/config.yaml"
-with open(path, "r") as f:
+with open(path, "r", encoding="utf-8") as f:
     config = yaml.safe_load(f)
 
 # ── 2. 統一初始化 Taichi ─────────────────────────────────────────────────
@@ -959,7 +995,7 @@ if __name__ == "__main__":
         pass
 
 --------------------------------------------------------------------------------------------
-nca_loader.py
+src\nca_loader.py
 """
 nca_loader.py
 跨 repo 載入 02-nca-cfd 訓練好的 .pth，回傳可直接推論的 model。
@@ -1050,7 +1086,7 @@ def load_nca_model(checkpoint_path: str, nca_cfd_src: str = None):
     return model, model_cfg, static_channels
 
 --------------------------------------------------------------------------------------------
-physics_colorizer.py
+src\physics_colorizer.py
 """
 physics_colorizer.py
 NCA 推論結果後處理：從 state[:11] 提取物理量並轉換為 RGB 影像。
