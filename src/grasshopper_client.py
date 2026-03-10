@@ -1,16 +1,19 @@
-# grasshopper_client.py  (NCA 版)
+# grasshopper_client.py  (視覺化切換版)
 # Run in Grasshopper GHPython component
 #
-# 輸入腳本端口（在 GH 元件上設定）：
+# ── 輸入端口 ─────────────────────────────────────────────────────────────
 #   run          : bool      - True 啟動連線
 #   polyline_tree: DataTree  - 多邊形幾何
 #   boundary     : Rectangle - 邊界矩形
 #   mode         : str       - "sdf" | "mask" | "nca"  (預設 "nca")
-#   img_save_path: str       - NCA 影像儲存路徑（選填，留空則不儲存）
+#   viz_mode     : str       - "velocity" | "vorticity" | "pressure"
+#                              "beaufort" | "stress"    (預設 "beaufort")
+#   img_save_path: str       - JPEG 儲存路徑（選填）
 #
-# 輸出端口：
-#   a      : 狀態字串
-#   b      : NCA 速度場統計字典（僅 NCA 模式有值）
+# ── 輸出端口 ─────────────────────────────────────────────────────────────
+#   a            : str       - 狀態訊息
+#   b            : dict      - 速度場統計 {speed_max_ms, beaufort_max, ...}
+#   c            : list[dict]- 蒲氏級數圖例（初次連線時回傳）
 
 import websocket
 import scriptcontext as sc
@@ -18,14 +21,15 @@ import json
 import Rhino.Geometry as rg
 import System
 import System.Drawing
+import System.IO
 
 
-# ── 幾何預處理（與原版相同）─────────────────────────────────────────────
-def get_payload(tree, bbox_rect, send_mode):
+# ── 幾何預處理 ────────────────────────────────────────────────────────────
+def get_payload(tree, bbox_rect, send_mode, send_viz_mode):
     if not bbox_rect:
         return None
-    bbox  = bbox_rect.GetBoundingBox(True)
-    min_p, max_p = bbox.Min, bbox.Max
+    bbox   = bbox_rect.GetBoundingBox(True)
+    min_p  = bbox.Min;  max_p = bbox.Max
     width  = max_p.X - min_p.X
     height = max_p.Y - min_p.Y
     if width <= 0 or height <= 0:
@@ -33,40 +37,48 @@ def get_payload(tree, bbox_rect, send_mode):
 
     all_polygons = []
     for i in range(tree.BranchCount):
-        branch = tree.Branch(i)
-        for poly_geo in branch:
-            success, polyline = poly_geo.TryGetPolyline()
-            if not success:
-                temp_pc = poly_geo.ToPolyline(0.1, 0, 0.1, 0)
-                if temp_pc:
-                    polyline = temp_pc.ToPolyline()
-                else:
-                    continue
-
-            pts = [
-                [(pt.X - min_p.X) / width, (pt.Y - min_p.Y) / height]
-                for pt in polyline
-            ]
+        for poly_geo in tree.Branch(i):
+            ok, polyline = poly_geo.TryGetPolyline()
+            if not ok:
+                pc = poly_geo.ToPolyline(0.1, 0, 0.1, 0)
+                polyline = pc.ToPolyline() if pc else None
+            if polyline is None:
+                continue
+            pts = [[(pt.X - min_p.X)/width, (pt.Y - min_p.Y)/height]
+                   for pt in polyline]
             all_polygons.append(pts)
 
     return json.dumps({
         "polygons": all_polygons,
-        "bounds": {"aspect": width / height},
-        "mode": send_mode,          # 每次發送都帶上模式，確保伺服器同步
+        "bounds":   {"aspect": width / height},
+        "mode":     send_mode,
+        "viz_mode": send_viz_mode,
     })
 
 
-# ── 主邏輯 ────────────────────────────────────────────────────────────────
-url        = "ws://localhost:8765"
-send_mode  = mode if "mode" in dir() and mode else "nca"   # 預設 NCA 模式
-save_path  = img_save_path if "img_save_path" in dir() else ""
+# ── 蒲氏級數圖例轉為 GH 可顯示的格式 ────────────────────────────────────
+def format_legend(legend_list):
+    """把 legend list 轉成文字色表格（GH Panel 顯示用）"""
+    lines = ["蒲氏風力級數色階："]
+    for item in legend_list:
+        max_str = f"< {item['max_ms']:.1f} m/s" if item["max_ms"] else "≥ 32.7 m/s"
+        lines.append(f"  {item['color_hex']}  {item['label']}  {max_str}")
+    return "\n".join(lines)
 
-status_str = "Off"
-vel_stats  = {}
+
+# ── 主邏輯 ────────────────────────────────────────────────────────────────
+url          = "ws://localhost:8765"
+send_mode    = mode     if "mode"     in dir() and mode     else "nca"
+send_viz     = viz_mode if "viz_mode" in dir() and viz_mode else "beaufort"
+save_path    = img_save_path if "img_save_path" in dir() else ""
+
+status_str   = "Off"
+vel_stats    = {}
+legend_out   = []
 
 if run:
     try:
-        # ── 取得或建立 WebSocket 連線 ──────────────────────────────────
+        # ── 取得或重建連線 ────────────────────────────────────────────
         ws = sc.sticky.get("sync_ws")
         if ws is None or not ws.connected:
             ws = websocket.create_connection(url, timeout=1.0)
@@ -75,42 +87,53 @@ if run:
         else:
             status_str = "Sending..."
 
-        # ── 準備並發送 payload ─────────────────────────────────────────
-        payload_str = get_payload(polyline_tree, boundary, send_mode)
-        if payload_str:
+        # ── 純切換 viz_mode（無幾何更新）─────────────────────────────
+        # 每次 GH 元件重算都會觸發，因此先判斷是否只有 viz_mode 改變
+        payload_str = get_payload(polyline_tree, boundary, send_mode, send_viz)
+
+        if payload_str is None:
+            # 沒有幾何，只送 viz_mode 切換訊號
+            ws.send(json.dumps({"viz_mode": send_viz}))
+        else:
             ws.send(payload_str)
 
-            # ── 接收回應 ───────────────────────────────────────────────
-            raw = ws.recv()
-            resp = json.loads(raw)
+        # ── 接收回應 ──────────────────────────────────────────────────
+        raw  = ws.recv()
+        resp = json.loads(raw)
 
-            if resp.get("status") == "ok":
-                current_mode = resp.get("mode", "?")
-                status_str = f"OK | mode={current_mode}"
+        if resp.get("status") == "ok":
+            vm   = resp.get("viz_mode", send_viz)
+            stats = resp.get("stats", {})
+            vel_stats = stats
 
-                # 速度場統計（NCA 模式）
-                if "stats" in resp:
-                    vel_stats = resp["stats"]
-                    status_str += f" | speed_max={vel_stats.get('speed_max', 0):.4f}"
+            bft  = stats.get("beaufort_max", "?")
+            spd  = stats.get("speed_max_ms", 0.0)
+            status_str = (
+                f"OK | {vm} | {spd:.1f} m/s | Bft {bft}"
+            )
 
-                # 速度場 JPEG 影像（若伺服器有附帶）
-                if "jpeg_b64" in resp and resp["jpeg_b64"]:
-                    import base64
-                    img_bytes = base64.b64decode(resp["jpeg_b64"])
-                    img_stream = System.IO.MemoryStream(img_bytes)
-                    bmp = System.Drawing.Bitmap(img_stream)
+            # 首次取得圖例
+            if "beaufort_legend" in resp:
+                legend_out = resp["beaufort_legend"]
+                sc.sticky["beaufort_legend"] = legend_out
+            elif "beaufort_legend" in sc.sticky:
+                legend_out = sc.sticky["beaufort_legend"]
 
-                    # 儲存至磁碟（選填）
-                    if save_path:
-                        bmp.Save(save_path)
-                        status_str += f" | img saved"
+            # JPEG 處理
+            if "jpeg_b64" in resp and resp["jpeg_b64"]:
+                import base64
+                img_bytes  = base64.b64decode(resp["jpeg_b64"])
+                img_stream = System.IO.MemoryStream(img_bytes)
+                bmp = System.Drawing.Bitmap(img_stream)
+                if save_path:
+                    bmp.Save(save_path)
+                    status_str += " | img saved"
 
-            elif resp.get("status") == "error":
-                status_str = f"Server Error: {resp.get('msg', '')}"
+        elif resp.get("status") == "error":
+            status_str = f"Server Error: {resp.get('msg', '')}"
 
     except Exception as e:
         status_str = f"Error: {e}"
-        # 連線失敗時清除，下次重連
         if "sync_ws" in sc.sticky:
             try:
                 sc.sticky["sync_ws"].close()
@@ -119,7 +142,6 @@ if run:
             del sc.sticky["sync_ws"]
 
 else:
-    # run = False：關閉連線
     if "sync_ws" in sc.sticky:
         try:
             sc.sticky["sync_ws"].close()
@@ -127,7 +149,9 @@ else:
             pass
         del sc.sticky["sync_ws"]
     status_str = "Off"
+    legend_out = sc.sticky.get("beaufort_legend", [])
 
 # ── 輸出 ──────────────────────────────────────────────────────────────────
 a = f"Status: {status_str}"
 b = vel_stats
+c = legend_out

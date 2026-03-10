@@ -1,8 +1,27 @@
-# WebSocket Server Configuration
+# config.yaml  (視覺化升級版)
+
+# ── 幾何引擎 ─────────────────────────────────────────────────
+data_res: 256
+gui_res: 512
+max_edges: 2000
+
+# ── WebSocket ────────────────────────────────────────────────
 ws_host: "localhost"
 ws_port: 8765
 
-# Engine Configuration
-data_res: 1024
-gui_res: 512
-max_edges: 2000
+# ── NCA 推論 ─────────────────────────────────────────────────
+nca_checkpoint: "C:/Users/GAI/Desktop/NCA_workspace/02-nca-cfd/train_log/LBMInspiredNCA/0307_5/nca_model_final_0307_1505.pth"
+
+# 每幀推進步數：1=即時互動，4=流暢，16=快速預覽穩態
+nca_steps_per_frame: 1
+
+# ── 視覺化設定 ───────────────────────────────────────────────
+# 預設視覺化模式（GH 端可隨時切換）
+# 可選：velocity | vorticity | pressure | beaufort | stress
+default_viz_mode: "beaufort"
+
+# LBM 單位速度 → m/s 換算係數
+# 計算方式：lbm_to_ms = 參考風速(m/s) / 訓練時的 Ma 數（典型 0.05~0.1）
+# 例：參考風速 10 m/s，Ma=0.1 → lbm_to_ms = 10 / 0.1 = 100
+# 若不確定，先設 10.0 做定性比較即可
+lbm_to_ms: 10.0

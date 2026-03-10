@@ -1,16 +1,16 @@
 src/
 ├─ __pycache__/
+│  ├─ engine_nca.cpython-313.pyc
 │  ├─ engine_sdf.cpython-313.pyc
 │  └─ engine.cpython-313.pyc
 ├─ client.py
-├─ engine_sdf_註解版.py
+├─ engine_nca.py
 ├─ engine_sdf.py
-├─ engine_註解版.py
 ├─ engine.py
 ├─ grasshopper_client.py
-├─ main_註解版.py
-└─ main.py
-
+├─ main.py
+├─ nca_loader.py
+└─ physics_colorizer.py
 
 --------------------------------------------------------------------------------------------
 client.py
@@ -150,6 +150,244 @@ class ComputeEngine:
             self.canvas[i, j] = self.mask_field[
                 i * self.res // self.gui_res, j * self.res // self.gui_res
             ]
+
+--------------------------------------------------------------------------------------------
+engine_nca.py
+"""
+engine_nca.py  (視覺化升級版)
+NCA 推論 + 多模式物理場後處理 + Taichi 渲染。
+
+新增：
+  - viz_mode 屬性（即時切換，無需重建引擎）
+  - 蒲氏風力級數模式
+  - lbm_to_ms 換算係數設定
+  - get_beaufort_legend() 供 GH 顯示色卡
+
+放置於：NCA_workspace/03-gh-frontend/src/engine_nca.py
+"""
+
+import base64
+import logging
+
+import cv2
+import numpy as np
+import taichi as ti
+import torch
+
+from physics_colorizer import colorize, VIZ_MODES, get_beaufort_legend
+
+logger = logging.getLogger("RhinoBridge")
+
+
+@ti.data_oriented
+class NCAEngine:
+    """
+    NCA 推論引擎（含多模式物理場視覺化）。
+
+    viz_mode 可以在運行中透過 WebSocket 訊息動態切換：
+        "velocity"  - 速度量值 (plasma)
+        "vorticity" - 渦度場
+        "pressure"  - 壓力偏差
+        "beaufort"  - 蒲氏風力級數（離散色階）
+        "stress"    - 剪切應力 pxy
+    """
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        nca_channels: int,
+        static_channels: int,
+        data_res: int = 256,
+        gui_res: int = 512,
+        lbm_to_ms: float = 10.0,
+        viz_mode: str = "velocity",
+    ):
+        self.model = model
+        self.nca_channels = nca_channels
+        self.static_channels = static_channels
+        self.phy_start = static_channels  # Ch2
+        self.data_res = data_res
+        self.gui_res = gui_res
+        self.device = next(model.parameters()).device
+
+        # 視覺化設定
+        self.lbm_to_ms = lbm_to_ms
+        self._viz_mode = viz_mode if viz_mode in VIZ_MODES else "velocity"
+
+        # ── Taichi 顯示畫布（RGB）──────────────────────────────────────
+        self.canvas = ti.Vector.field(3, dtype=ti.f32, shape=(gui_res, gui_res))
+
+        # ── 中間 numpy buffer（低解析度 RGB）────────────────────────────
+        self._rgb_np = np.zeros((data_res, data_res, 3), dtype=np.float32)
+        self._rgb_field = ti.Vector.field(3, dtype=ti.f32, shape=(data_res, data_res))
+
+        # ── NCA 狀態張量 [1, C, H, W] ─────────────────────────────────
+        self.state: torch.Tensor | None = None
+        self._ready = False
+
+        logger.info(
+            f"[NCAEngine] 初始化 | res={data_res} | ch={nca_channels} | "
+            f"static={static_channels} | lbm_to_ms={lbm_to_ms} | "
+            f"viz={self._viz_mode} | device={self.device}"
+        )
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 屬性
+    # ──────────────────────────────────────────────────────────────────────
+
+    @property
+    def viz_mode(self) -> str:
+        return self._viz_mode
+
+    @viz_mode.setter
+    def viz_mode(self, mode: str):
+        if mode not in VIZ_MODES:
+            raise ValueError(f"未知的視覺化模式 '{mode}'，可用: {VIZ_MODES}")
+        if mode != self._viz_mode:
+            self._viz_mode = mode
+            logger.info(f"[NCAEngine] 切換視覺化模式 → {mode}")
+            # 立即重新渲染（若狀態存在）
+            if self._ready and self.state is not None:
+                self._render()
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 公開 API
+    # ──────────────────────────────────────────────────────────────────────
+
+    def reset_state(self, mask_np: np.ndarray, sdf_np: np.ndarray) -> None:
+        """
+        幾何改變後重置 NCA 狀態。
+        由 ws_handler 在幾何更新且模式為 "nca" 時呼叫。
+
+        Args:
+            mask_np : [H, W] float32 (1=障礙物 0=流體)  → from engine_mask.mask_field
+            sdf_np  : [H, W] float32 (負=固體內 正=流體) → from engine_sdf.sdf_field
+        """
+        H, W = mask_np.shape
+        C = self.nca_channels
+
+        state = torch.zeros((1, C, H, W), dtype=torch.float32, device=self.device)
+
+        # Ch0: obstacle mask
+        state[0, 0] = torch.from_numpy(mask_np).to(self.device)
+        # Ch1: SDF（縮放至 [-1,1]）
+        sdf_norm = np.clip(sdf_np / (max(H, W) * 0.5), -1.0, 1.0).astype(np.float32)
+        state[0, 1] = torch.from_numpy(sdf_norm).to(self.device)
+        # Ch2 (rho): 流體區域初始化為 1.0
+        fluid = torch.from_numpy(1.0 - mask_np).to(self.device)
+        state[0, self.phy_start] = fluid
+
+        self.state = state
+        self._ready = True
+        logger.info(f"[NCAEngine] Seed 已重置 H={H} W={W}")
+
+    @torch.no_grad()
+    def step(self, n_steps: int = 1) -> None:
+        """
+        推進 NCA 演化 n_steps 步，然後依目前 viz_mode 更新畫布。
+        由 render_loop 每幀呼叫。
+        """
+        if not self._ready or self.state is None:
+            return
+
+        x = self.state
+        for _ in range(n_steps):
+            x = self.model(x, update_rate=1.0)
+            if torch.isnan(x).any():
+                logger.warning("[NCAEngine] 偵測到 NaN，清除物理通道。")
+                x[0, self.phy_start :] = 0.0
+                break
+
+        self.state = x
+        self._render()
+
+    def set_viz_mode(self, mode: str) -> None:
+        """由 WebSocket 訊息呼叫的入口（等同 self.viz_mode = mode）。"""
+        self.viz_mode = mode
+
+    def get_jpeg_b64(self, quality: int = 75) -> str:
+        """編碼為 JPEG base64，供 WebSocket 回傳給 GH。"""
+        rgb_u8 = (self._rgb_np * 255).clip(0, 255).astype(np.uint8)
+        bgr = rgb_u8[..., ::-1]
+        ok, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, quality])
+        return base64.b64encode(buf.tobytes()).decode("ascii") if ok else ""
+
+    def get_velocity_stats(self) -> dict:
+        """回傳速度場統計，供 GH 數值顯示。"""
+        if self.state is None:
+            return {}
+        s = self.state[0].cpu().numpy()
+        rho = s[self.phy_start]
+        jx = s[self.phy_start + 3]
+        jy = s[self.phy_start + 5]
+        safe_rho = np.clip(rho, 1e-2, None)
+        ux = jx / safe_rho
+        uy = jy / safe_rho
+        speed_lbm = np.sqrt(ux**2 + uy**2)
+        speed_ms = speed_lbm * self.lbm_to_ms
+        fluid = s[0] < 0.5
+        return {
+            "viz_mode": self._viz_mode,
+            "speed_max_ms": float(speed_ms[fluid].max()) if fluid.any() else 0.0,
+            "speed_mean_ms": float(speed_ms[fluid].mean()) if fluid.any() else 0.0,
+            "beaufort_max": (
+                int(_ms_to_beaufort(float(speed_ms[fluid].max()))) if fluid.any() else 0
+            ),
+        }
+
+    @staticmethod
+    def available_viz_modes() -> list[str]:
+        return VIZ_MODES
+
+    @staticmethod
+    def beaufort_legend() -> list[dict]:
+        """回傳蒲氏級數圖例，供 GH 顯示色卡說明。"""
+        return get_beaufort_legend()
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 內部：物理場渲染
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _render(self) -> None:
+        """把 state[:11] 透過 physics_colorizer 轉為 RGB 並推到 Taichi。"""
+        state_np = self.state[0, :11].cpu().numpy()  # [11, H, W]
+
+        try:
+            rgb = colorize(
+                state_np,
+                mode=self._viz_mode,
+                lbm_to_ms=self.lbm_to_ms,
+            )  # [H, W, 3] float32
+        except Exception as e:
+            logger.error(f"[NCAEngine] colorize 失敗: {e}")
+            return
+
+        self._rgb_np[:] = rgb
+        self._rgb_field.from_numpy(rgb)
+        self._upsample_canvas()
+
+    @ti.kernel
+    def _upsample_canvas(self):
+        """[GPU] 最近鄰升採樣到 GUI 解析度。"""
+        for i, j in self.canvas:
+            si = i * self.data_res // self.gui_res
+            sj = j * self.data_res // self.gui_res
+            self.canvas[i, j] = self._rgb_field[si, sj]
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# 輔助函數
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _ms_to_beaufort(speed_ms: float) -> int:
+    """將 m/s 速度轉換為蒲氏風力級數（0-12）。"""
+    from physics_colorizer import BEAUFORT_LIMITS_MS
+
+    for level, upper in enumerate(BEAUFORT_LIMITS_MS):
+        if speed_ms < upper:
+            return level
+    return 12
 
 --------------------------------------------------------------------------------------------
 engine_sdf.py
@@ -327,424 +565,150 @@ class SDFEngine:
         self.render_isolines()
 
 --------------------------------------------------------------------------------------------
-engine_sdf_註解版.py
-# 匯入必要的函式庫
-import taichi as ti  # 用於 GPU 計算
-import numpy as np  # 用於數值計算和數據交換
-import asyncio      # 用於非同步程式設計 (在此檔案中未使用，但保留以保持一致性)
-
-# 注意：在此檔案中不呼叫 ti.init()。
-# 為了確保所有 Taichi 物件 (field, kernel) 都在同一個計算上下文中，
-# `ti.init()` 應該在主程式 (main.py) 中統一呼叫一次。
-
-# --- Taichi 資料導向類別 ---
-@ti.data_oriented
-class SDFEngine:
-    # --- 初始化函式 ---
-    def __init__(self, data_res=256, gui_res=512):
-        # --- 成員變數定義 ---
-        self.res = data_res          # SDF 計算網格的解析度
-        self.gui_res = gui_res        # GUI 顯示的解析度
-
-        # --- Taichi Field 定義 ---
-        # 建立一個 2D 浮點數 field，用於儲存每個網格點的符號距離值 (Signed Distance Field)
-        self.sdf_field = ti.field(dtype=ti.f32, shape=(self.res, self.res))
-        # 建立一個 2D 向量 field，用於儲存最終渲染出的彩色圖像
-        # ti.Vector.field(3, ...) 表示每個像素儲存一個 3 維向量 (R, G, B)
-        self.canvas = ti.Vector.field(3, dtype=ti.f32, shape=(self.gui_res, self.gui_res))
-
-        # --- 邊緣數據儲存 (與 ComputeEngine 相同) ---
-        self.MAX_EDGES = 2000  # 最大邊緣數
-        self.edges = ti.Vector.field(2, dtype=ti.f32, shape=(self.MAX_EDGES, 2)) # 儲存邊的兩個頂點
-        self.num_edges = ti.field(dtype=ti.i32, shape=()) # 儲存當前有效的邊數
-
-        # 此引擎不建立自己的 GUI，而是由主程式統一管理和渲染
-        self.is_running = True # 狀態旗標
-
-    # --- Taichi GPU 輔助函式 ---
-    # @ti.func 裝飾器表示這是一個可以在 ti.kernel 中被呼叫的輔助函式
-    # 它本身不會直接在 GPU 上啟動，而是會被內聯 (inline) 到呼叫它的核心函式中
-    @ti.func
-    def dist_point_segment(self, p, v0, v1):
-        """計算點 p 到線段 v0-v1 的最短距離 (在 GPU 上執行)"""
-        # 向量運算
-        pa = p - v0  # 從 v0 指向 p 的向量
-        ba = v1 - v0  # 從 v0 指向 v1 的向量 (線段本身)
-        # 計算 p 在 ba 上的投影長度比例 h
-        # h = (pa · ba) / |ba|^2
-        # ti.max(0.0, ti.min(1.0, ...)) 將 h 的值限制在 [0, 1] 範圍內
-        # 如果 h < 0，表示 p 的投影點在 v0 之外，離 p 最近的點是 v0
-        # 如果 h > 1，表示 p 的投影點在 v1 之外，離 p 最近的點是 v1
-        # 如果 0 <= h <= 1，表示投影點在線段上
-        h = ti.max(0.0, ti.min(1.0, pa.dot(ba) / ba.dot(ba)))
-        # 最短距離向量 = pa - ba * h
-        # .norm() 計算向量的長度 (L2 範數)
-        return (pa - ba * h).norm()
-
-    # --- Taichi GPU 核心函式 ---
-    @ti.kernel
-    def compute_sdf_gpu(self):
-        """
-        在 GPU 上並行計算每個像素的符號距離場 (SDF)。
-        SDF 的值代表該點到最近邊緣的距離，符號代表該點在圖形內部 (-) 或外部 (+)。
-        """
-        # 並行遍歷計算網格中的每一個像素 (i, j)
-        for i, j in self.sdf_field:
-            # 將像素索引轉換為 [0, 1] 範圍的標準化座標
-            p = ti.Vector([i / self.res, j / self.res])
-
-            min_dist = 1e9  # 初始化一個極大的距離值
-            winding = 0       # 初始化環繞數
-
-            # 遍歷所有有效的邊緣
-            for k in range(self.num_edges[None]):
-                v0 = self.edges[k, 0] # 邊的起點
-                v1 = self.edges[k, 1] # 邊的終點
-
-                # 1. 計算點 p 到目前這條邊的最短物理距離
-                d = self.dist_point_segment(p, v0, v1)
-                min_dist = ti.min(min_dist, d) # 更新全局最小距離
-
-                # 2. 同時計算環繞數 (Winding Number) 來判斷點的內外
-                if v0.y <= p.y < v1.y and p.x < (v1.x - v0.x) * (p.y - v0.y) / (v1.y - v0.y) + v0.x:
-                    winding += 1 # 向上穿越
-                elif v1.y <= p.y < v0.y and p.x < (v1.x - v0.x) * (p.y - v0.y) / (v1.y - v0.y) + v0.x:
-                    winding -= 1 # 向下穿越
-
-            # 根據環繞數決定距離的符號
-            if winding != 0:
-                # 如果環繞數不為 0，表示點在內部，距離為負
-                self.sdf_field[i, j] = -min_dist
-            else:
-                # 如果環繞數為 0，表示點在外部，距離為正
-                self.sdf_field[i, j] = min_dist
-
-    # --- Taichi GPU 核心函式 ---
-    @ti.kernel
-    def render_isolines(self):
-        """將計算好的 SDF 距離場渲染成漂亮的等高線視覺效果"""
-        # 並行遍歷顯示畫布上的每一個像素
-        for i, j in self.canvas:
-            # 透過最近鄰插值從 SDF 計算網格中取樣
-            sdf_val = self.sdf_field[i * self.res // self.gui_res, j * self.res // self.gui_res]
-
-            # 初始化顏色為黑色
-            color = ti.Vector([0.0, 0.0, 0.0])
-
-            # --- 視覺化邏輯 ---
-            # 使用 sin 函數根據 SDF 值產生波浪效果，形成等高線
-            # 頻率 150.0 決定了線條的密度
-            wave = ti.sin(sdf_val * 150.0)
-
-            if sdf_val < 0:  # 內部
-                # 基礎顏色為藍色調
-                base_blue = ti.Vector([0.1, 0.4, 0.8])
-                # 使用 wave 在基礎藍色和更亮的藍色之間過渡，產生波紋
-                color = base_blue * (0.8 + 0.2 * wave)
-            else:  # 外部
-                # 基礎顏色為橙色
-                base_orange = ti.Vector([1.0, 0.5, 0.2])
-                # 距離越遠，顏色越暗 (指數衰減)
-                dist_attenuation = ti.exp(-sdf_val * 10.0)
-                # 橙色波紋疊加衰減效果
-                color = base_orange * (0.5 + 0.5 * wave) * dist_attenuation
-
-            # 當 SDF 值非常接近 0 時，畫一條白色的邊界線
-            if ti.abs(sdf_val) < 0.005:
-                color = ti.Vector([1.0, 1.0, 1.0])
-
-            # 將最終計算出的顏色賦值給畫布像素
-            self.canvas[i, j] = color
-
-    # --- 更新幾何數據的函式 (CPU) ---
-    def update_geometry(self, polygons_list):
-        edge_data = [] # 暫存邊緣的 Python 列表
-        for poly in polygons_list:
-            if len(poly) < 3:
-                continue
-
-            # 同樣需要確保多邊形是逆時針方向，以保證 Winding Number 計算的正確性
-            area = 0.0
-            for i in range(len(poly)):
-                j = (i + 1) % len(poly)
-                area += poly[i][0] * poly[j][1] - poly[j][0] * poly[i][1]
-            if area < 0:
-                poly = poly[::-1] # 反轉
-
-            # 建立邊緣列表
-            for i in range(len(poly)):
-                p1 = poly[i]
-                p2 = poly[(i + 1) % len(poly)]
-                edge_data.append([p1, p2])
-
-        # 如果沒有邊緣數據，直接返回
-        if not edge_data:
-            # (可以選擇在這裡清空 sdf_field 和 canvas)
-            self.num_edges[None] = 0
-            self.sdf_field.fill(1e9) # 用一個很大的正數填充，表示全都是外部
-            self.render_isolines()
-            return
-
-        # --- 數據傳輸到 GPU ---
-        count = min(len(edge_data), self.MAX_EDGES) # 確保不超過最大邊緣數
-        np_edges = np.zeros((self.MAX_EDGES, 2, 2), dtype=np.float32)
-        np_edges[:count] = np.array(edge_data[:count], dtype=np.float32)
-
-        self.edges.from_numpy(np_edges)
-        self.num_edges[None] = count
-
-        # --- 觸發 GPU 計算和渲染 ---
-        # 依序呼叫核心函式
-        self.compute_sdf_gpu()   # 第一步：計算 SDF
-        self.render_isolines() # 第二步：根據 SDF 結果渲染視覺效果
-
---------------------------------------------------------------------------------------------
-engine_註解版.py
-# 匯入必要的函式庫
-import taichi as ti  # 用於 GPU 計算
-import numpy as np  # 用於數值計算，特別是與 Taichi 進行數據交換
-import asyncio  # 用於非同步操作 (在此檔案的 run_loop 中使用)
-
-# --- Taichi 資料導向類別 ---
-# @ti.data_oriented 裝飾器告訴 Taichi 這是一個資料導向的類別
-# 這使得類別中的 `ti.kernel` 和 `ti.func` 可以存取類別成員 (例如 self.mask_field)
-@ti.data_oriented
-class ComputeEngine:
-    # --- 初始化函式 ---
-    # 在建立 ComputeEngine 物件時會被呼叫
-    def __init__(self, data_res=256, gui_res=512):
-        # --- 成員變數定義 ---
-        self.res = data_res  # 計算網格的解析度 (例如 256x256)
-        self.gui_res = gui_res  # GUI 視窗的解析度 (例如 512x512)
-
-        # --- Taichi Field 定義 ---
-        # Field 是 Taichi 中用於儲存數據的容器，它會被分配在指定的計算後端 (例如 GPU) 的記憶體中
-        # 建立一個 2D 的浮點數 field，用於儲存每個像素是否在多邊形內部的遮罩值 (0 或 1)
-        self.mask_field = ti.field(dtype=ti.f32, shape=(self.res, self.res))
-        # 建立一個 2D 的浮點數 field，用於最終在 GUI 上顯示的畫布
-        self.canvas = ti.field(dtype=ti.f32, shape=(self.gui_res, self.gui_res))
-
-        # --- 邊緣數據儲存 ---
-        self.MAX_EDGES = 2000  # 設定一個靜態的最大邊緣數量，以預先分配記憶體
-        # 建立一個 2D 向量 field 來儲存所有多邊形的邊緣
-        # shape=(self.MAX_EDGES, 2) 表示有 MAX_EDGES 條邊，每條邊有 2 個頂點
-        # ti.Vector.field(2, ...) 表示每個頂點是一個 2D 向量 (x, y)
-        self.edges = ti.Vector.field(2, dtype=ti.f32, shape=(self.MAX_EDGES, 2))
-        # 建立一個 0D 的整數 field 來儲存目前有效的邊緣數量
-        # shape=() 表示這是一個純量 (scalar)
-        self.num_edges = ti.field(dtype=ti.i32, shape=())
-
-        # --- GUI 和狀態 ---
-        # 建立一個獨立的 GUI 視窗 (雖然在主程式中統一管理，但此處展示了引擎也可以有自己的視窗)
-        self.gui = ti.GUI("GPU SDF Union Mode", res=self.gui_res)
-        self.is_running = True  # 控制渲染迴圈的狀態
-
-    # --- Taichi GPU 核心函式 ---
-    # @ti.kernel 裝飾器表示這個函式將會在 GPU 上並行執行
-    @ti.kernel
-    def compute_mask_gpu(self):
-        """
-        改進版：使用 Winding Number (環繞數) 算法在 GPU 上計算遮罩
-        這個算法可以正確處理多個重疊多邊形的聯集 (Boolean Union)，
-        避免了簡單奇偶規則在重疊處會產生空洞的問題。
-        """
-        # `for i, j in self.mask_field:` 是一個並行迴圈
-        # Taichi 會自動將這個迴圈的每一次迭代分配給一個 GPU 核心去執行
-        for i, j in self.mask_field:
-            # 將像素的整數索引 (i, j) 轉換為標準化的浮點數座標 (p)，範圍在 [0, 1] 之間
-            p = ti.Vector([i / self.res, j / self.res])
-
-            # 初始化環繞數計數器為 0
-            winding = 0
-
-            # 遍歷目前所有的有效邊緣
-            for e_idx in range(self.num_edges[None]):
-                # 取得邊緣的兩個頂點 v0 和 v1
-                # self.num_edges[None] 是讀取 0D field `num_edges` 的值
-                v0 = self.edges[e_idx, 0]
-                v1 = self.edges[e_idx, 1]
-
-                # --- Winding Number 算法核心 ---
-                # 從點 p 向右發射一條水平射線，計算這條射線與邊緣的相交情況
-                # 判斷射線是否在邊緣的 Y 軸範圍內
-                if v0.y <= p.y < v1.y:  # 邊緣是向上穿越射線 (Upward crossing)
-                    # 計算射線與邊緣的交點的 X 座標
-                    # 如果交點在點 p 的右邊 (即點 p 在交點的左邊)，表示射線與邊緣相交
-                    if p.x < (v1.x - v0.x) * (p.y - v0.y) / (v1.y - v0.y) + v0.x:
-                        winding += 1  # 環繞數加 1
-                elif v1.y <= p.y < v0.y:  # 邊緣是向下穿越射線 (Downward crossing)
-                    if p.x < (v1.x - v0.x) * (p.y - v0.y) / (v1.y - v0.y) + v0.x:
-                        winding -= 1  # 環繞數減 1
-
-            # 檢查最終的環繞數
-            # 如果環繞數不為 0，表示點 p 在多邊形內部
-            # 如果為 0，表示點 p 在外部
-            self.mask_field[i, j] = 1.0 if winding != 0 else 0.0
-
-    # --- Python CPU 函式 ---
-    def _ensure_ccw(self, poly):
-        """
-        強制多邊形頂點為逆時針方向 (Counter-Clockwise, CCW)。
-        原理：計算多邊形的帶符號面積 (Signed Area)。
-        如果面積為負，表示頂點是順時針排列，則將頂點列表反轉。
-        這對於 Winding Number 算法至關重要，因為它依賴於邊緣方向的一致性來實現聯集。
-        """
-        area = 0.0
-        num_verts = len(poly)
-        for i in range(num_verts):
-            j = (i + 1) % num_verts  # 下一個頂點的索引
-            area += poly[i][0] * poly[j][1]
-            area -= poly[j][0] * poly[i][1]
-
-        # 面積乘以 0.5 才是真實面積，但這裡我們只需要判斷正負
-        if area < 0:
-            return poly[::-1]  # 反轉列表
-        return poly
-
-    # --- 更新幾何數據的函式 ---
-    # 這個函式在 CPU 上執行，準備好數據後傳輸到 GPU
-    def update_geometry(self, polygons_list, bounds):
-        edge_data = []  # 建立一個 Python 列表來暫存所有邊緣
-
-        # 遍歷從客戶端傳來的所有多邊形
-        for poly in polygons_list:
-            if len(poly) < 3:
-                continue  # 一個有效的多邊形至少需要 3 個頂點
-
-            # 1. 強制所有多邊形都為逆時針方向 (關鍵步驟!)
-            # 這樣可以確保當兩個多邊形重疊時，它們的環繞數是相加 (1+1=2)，而不是相互抵消 (1-1=0)。
-            clean_poly = self._ensure_ccw(poly)
-
-            # 2. 從多邊形的頂點構建邊緣列表
-            num_verts = len(clean_poly)
-            for i in range(num_verts):
-                p1 = clean_poly[i]  # 當前頂點
-                p2 = clean_poly[(i + 1) % num_verts]  # 下一個頂點 (最後一個頂點連回第一個)
-                edge_data.append([p1, p2])  # 將這條邊加入列表
-
-        # 如果沒有任何邊緣數據 (例如傳入空列表)，則清空畫布
-        if not edge_data:
-            self.num_edges[None] = 0
-            self.mask_field.fill(0)  # 將遮罩 field 全部填為 0
-            # 即使沒有邊緣，也需要呼叫一次 GPU 函式來更新畫布狀態
-            self.compute_mask_gpu()
-            return
-
-        # 檢查邊緣數量是否超過預先分配的最大值
-        current_count = len(edge_data)
-        if current_count > self.MAX_EDGES:
-            print(f"警告: 邊緣數量 {current_count} 超出最大值，將被截斷。")
-            edge_data = edge_data[:self.MAX_EDGES]  # 截斷列表
-            current_count = self.MAX_EDGES
-
-        # 3. 準備數據並傳輸到 GPU
-        # 建立一個符合 Taichi Field 形狀的 NumPy 陣列
-        np_edges = np.zeros((self.MAX_EDGES, 2, 2), dtype=np.float32)
-        # 將 Python 列表轉換為 NumPy 陣列並填入
-        np_edges[:current_count] = np.array(edge_data, dtype=np.float32)
-
-        # 使用 from_numpy() 將 CPU 上的 NumPy 陣列數據一次性傳輸到 GPU 上的 Taichi Field
-        self.edges.from_numpy(np_edges)
-        # 更新有效的邊緣數量
-        self.num_edges[None] = current_count
-
-        # 呼叫 GPU 核心函式，觸發計算
-        self.compute_mask_gpu()
-
-    # --- Taichi GPU 核心函式 ---
-    @ti.kernel
-    def _upsample(self):
-        """
-        升採樣函式：將低解析度的計算結果 (mask_field) 放大到高解析度的畫布 (canvas) 上。
-        這是一種效能優化技巧：用較低解析度進行昂貴的計算，然後用較高解析度進行顯示。
-        """
-        # 並行遍歷高解析度的畫布
-        for i, j in self.canvas:
-            # 透過整數除法，找到 canvas 上的像素 (i, j) 對應到 mask_field 中的哪個像素
-            # 這樣可以實現最近鄰插值 (Nearest-neighbor interpolation)
-            self.canvas[i, j] = self.mask_field[
-                i * self.res // self.gui_res, j * self.res // self.gui_res
-            ]
-
-    # --- 非同步渲染迴圈 (範例) ---
-    async def run_loop(self):
-        # 這個迴圈主要用於獨立測試此引擎
-        while self.is_running and self.gui.running:
-            self._upsample()  # 更新畫布
-            self.gui.set_image(self.canvas)  # 將畫布設定到 GUI
-            self.gui.show()  # 顯示
-            await asyncio.sleep(0.01)  # 非同步等待
-
---------------------------------------------------------------------------------------------
 grasshopper_client.py
-# run in grasshopper ghpython script component
-# r: websocket-client
+# grasshopper_client.py  (視覺化切換版)
+# Run in Grasshopper GHPython component
+#
+# ── 輸入端口 ─────────────────────────────────────────────────────────────
+#   run          : bool      - True 啟動連線
+#   polyline_tree: DataTree  - 多邊形幾何
+#   boundary     : Rectangle - 邊界矩形
+#   mode         : str       - "sdf" | "mask" | "nca"  (預設 "nca")
+#   viz_mode     : str       - "velocity" | "vorticity" | "pressure"
+#                              "beaufort" | "stress"    (預設 "beaufort")
+#   img_save_path: str       - JPEG 儲存路徑（選填）
+#
+# ── 輸出端口 ─────────────────────────────────────────────────────────────
+#   a            : str       - 狀態訊息
+#   b            : dict      - 速度場統計 {speed_max_ms, beaufort_max, ...}
+#   c            : list[dict]- 蒲氏級數圖例（初次連線時回傳）
+
 import websocket
 import scriptcontext as sc
 import json
 import Rhino.Geometry as rg
+import System
+import System.Drawing
+import System.IO
 
 
-# --- 幾何數據預處理 (不變) ---
-def get_payload(tree, bbox_rect):
+# ── 幾何預處理 ────────────────────────────────────────────────────────────
+def get_payload(tree, bbox_rect, send_mode, send_viz_mode):
     if not bbox_rect:
         return None
-    bbox = bbox_rect.GetBoundingBox(True)
-    min_p, max_p = bbox.Min, bbox.Max
-    width, height = max_p.X - min_p.X, max_p.Y - min_p.Y
+    bbox   = bbox_rect.GetBoundingBox(True)
+    min_p  = bbox.Min;  max_p = bbox.Max
+    width  = max_p.X - min_p.X
+    height = max_p.Y - min_p.Y
+    if width <= 0 or height <= 0:
+        return None
 
     all_polygons = []
     for i in range(tree.BranchCount):
-        branch = tree.Branch(i)
-        for poly_geo in branch:
-            success, polyline = poly_geo.TryGetPolyline()
-            if not success:
-                temp_pc = poly_geo.ToPolyline(0.1, 0, 0.1, 0)
-                if temp_pc:
-                    polyline = temp_pc.ToPolyline()
-                else:
-                    continue
+        for poly_geo in tree.Branch(i):
+            ok, polyline = poly_geo.TryGetPolyline()
+            if not ok:
+                pc = poly_geo.ToPolyline(0.1, 0, 0.1, 0)
+                polyline = pc.ToPolyline() if pc else None
+            if polyline is None:
+                continue
+            pts = [[(pt.X - min_p.X)/width, (pt.Y - min_p.Y)/height]
+                   for pt in polyline]
+            all_polygons.append(pts)
 
-            current_poly_pts = [
-                [(pt.X - min_p.X) / width, (pt.Y - min_p.Y) / height] for pt in polyline
-            ]
-            all_polygons.append(current_poly_pts)
+    return json.dumps({
+        "polygons": all_polygons,
+        "bounds":   {"aspect": width / height},
+        "mode":     send_mode,
+        "viz_mode": send_viz_mode,
+    })
 
-    return json.dumps({"polygons": all_polygons, "bounds": {"aspect": width / height}})
+
+# ── 蒲氏級數圖例轉為 GH 可顯示的格式 ────────────────────────────────────
+def format_legend(legend_list):
+    """把 legend list 轉成文字色表格（GH Panel 顯示用）"""
+    lines = ["蒲氏風力級數色階："]
+    for item in legend_list:
+        max_str = f"< {item['max_ms']:.1f} m/s" if item["max_ms"] else "≥ 32.7 m/s"
+        lines.append(f"  {item['color_hex']}  {item['label']}  {max_str}")
+    return "\n".join(lines)
 
 
-# --- 同步連線與發送邏輯 ---
+# ── 主邏輯 ────────────────────────────────────────────────────────────────
+url          = "ws://localhost:8765"
+send_mode    = mode     if "mode"     in dir() and mode     else "nca"
+send_viz     = viz_mode if "viz_mode" in dir() and viz_mode else "beaufort"
+save_path    = img_save_path if "img_save_path" in dir() else ""
 
-url = "ws://localhost:8765"
+status_str   = "Off"
+vel_stats    = {}
+legend_out   = []
 
 if run:
     try:
-        # 1. 取得或建立連線
+        # ── 取得或重建連線 ────────────────────────────────────────────
         ws = sc.sticky.get("sync_ws")
-
-        # 檢查連線是否還活著，如果關閉了就重連
         if ws is None or not ws.connected:
-            # 使用完整路徑呼叫
-            ws = websocket.create_connection(url, timeout=0.5)
+            ws = websocket.create_connection(url, timeout=1.0)
             sc.sticky["sync_ws"] = ws
-            status = "Connected (Sync)"
+            status_str = "Connected"
         else:
-            status = "Sending..."
+            status_str = "Sending..."
 
-        # 2. 準備並發送
-        payload_str = get_payload(polyline_tree, boundary)
-        if payload_str:
+        # ── 純切換 viz_mode（無幾何更新）─────────────────────────────
+        # 每次 GH 元件重算都會觸發，因此先判斷是否只有 viz_mode 改變
+        payload_str = get_payload(polyline_tree, boundary, send_mode, send_viz)
+
+        if payload_str is None:
+            # 沒有幾何，只送 viz_mode 切換訊號
+            ws.send(json.dumps({"viz_mode": send_viz}))
+        else:
             ws.send(payload_str)
 
+        # ── 接收回應 ──────────────────────────────────────────────────
+        raw  = ws.recv()
+        resp = json.loads(raw)
+
+        if resp.get("status") == "ok":
+            vm   = resp.get("viz_mode", send_viz)
+            stats = resp.get("stats", {})
+            vel_stats = stats
+
+            bft  = stats.get("beaufort_max", "?")
+            spd  = stats.get("speed_max_ms", 0.0)
+            status_str = (
+                f"OK | {vm} | {spd:.1f} m/s | Bft {bft}"
+            )
+
+            # 首次取得圖例
+            if "beaufort_legend" in resp:
+                legend_out = resp["beaufort_legend"]
+                sc.sticky["beaufort_legend"] = legend_out
+            elif "beaufort_legend" in sc.sticky:
+                legend_out = sc.sticky["beaufort_legend"]
+
+            # JPEG 處理
+            if "jpeg_b64" in resp and resp["jpeg_b64"]:
+                import base64
+                img_bytes  = base64.b64decode(resp["jpeg_b64"])
+                img_stream = System.IO.MemoryStream(img_bytes)
+                bmp = System.Drawing.Bitmap(img_stream)
+                if save_path:
+                    bmp.Save(save_path)
+                    status_str += " | img saved"
+
+        elif resp.get("status") == "error":
+            status_str = f"Server Error: {resp.get('msg', '')}"
+
     except Exception as e:
-        status = f"Connect Error: {e}"
-        # 出錯時清除連線，下次重試
+        status_str = f"Error: {e}"
         if "sync_ws" in sc.sticky:
             try:
                 sc.sticky["sync_ws"].close()
             except:
                 pass
             del sc.sticky["sync_ws"]
+
 else:
     if "sync_ws" in sc.sticky:
         try:
@@ -752,13 +716,24 @@ else:
         except:
             pass
         del sc.sticky["sync_ws"]
-    status = "Off"
+    status_str = "Off"
+    legend_out = sc.sticky.get("beaufort_legend", [])
 
-a = f"Status: {status}"
+# ── 輸出 ──────────────────────────────────────────────────────────────────
+a = f"Status: {status_str}"
+b = vel_stats
+c = legend_out
 
 --------------------------------------------------------------------------------------------
 main.py
-# 匯入必要套件
+# main.py  (視覺化升級版)
+# 在原有 mask / sdf / nca 模式基礎上，新增 viz_mode 切換
+#
+# config.yaml 新增欄位：
+#   nca_checkpoint: "../../02-nca-cfd/train_log/MMDD_N/model_latest.pth"
+#   nca_steps_per_frame: 4
+#   lbm_to_ms: 10.0          # LBM u=1.0 對應幾 m/s（影響 Beaufort 換算）
+
 import taichi as ti
 import asyncio
 import websockets
@@ -767,24 +742,27 @@ import logging
 import numpy as np
 import yaml
 
-# --- 1. 讀取設定檔 ---
-with open("config.yaml", "r") as f:
+# ── 1. 讀取設定檔 ─────────────────────────────────────────────────────────
+path = "C:/Users/GAI/Desktop/NCA_workspace/03-gh-frontend/config.yaml"
+with open(path, "r") as f:
     config = yaml.safe_load(f)
 
-# --- 2. 初始化 Taichi ---
+# ── 2. 統一初始化 Taichi ─────────────────────────────────────────────────
 ti.init(arch=ti.gpu)
 
-# --- 3. 匯入自定義引擎 ---
+# ── 3. 匯入引擎 ──────────────────────────────────────────────────────────
 from engine import ComputeEngine
 from engine_sdf import SDFEngine
+from engine_nca import NCAEngine  # engine_nca.py (視覺化升級版)
+from nca_loader import load_nca_model
 
-# --- 4. 設定日誌 ---
+# ── 4. 設定日誌 ──────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
 )
 logger = logging.getLogger("RhinoBridge")
 
-# --- 5. 初始化計算引擎 ---
+# ── 5. 幾何引擎 ──────────────────────────────────────────────────────────
 engine_config = {
     "data_res": config["data_res"],
     "gui_res": config["gui_res"],
@@ -793,94 +771,184 @@ engine_config = {
 engine_mask = ComputeEngine(**engine_config)
 engine_sdf = SDFEngine(**engine_config)
 
-# 建立統一的 GUI 視窗
-gui = ti.GUI("Rhino Taichi Bridge", res=config["gui_res"])
+# ── 6. NCA 引擎 ──────────────────────────────────────────────────────────
+engine_nca: NCAEngine | None = None
 
-# --- 6. 全域狀態 ---
-current_mode = "sdf"  # 預設模式
-latest_polygons = []  # 快取最新的幾何數據
+if ckpt := config.get("nca_checkpoint"):
+    try:
+        model, model_cfg, static_ch = load_nca_model(ckpt)
+        engine_nca = NCAEngine(
+            model=model,
+            nca_channels=model_cfg["nca_channels"],
+            static_channels=static_ch,
+            data_res=config["data_res"],
+            gui_res=config["gui_res"],
+            lbm_to_ms=config.get("lbm_to_ms", 10.0),
+            viz_mode=config.get("default_viz_mode", "velocity"),
+        )
+        logger.info("[Main] ✅ NCA 引擎初始化成功")
+    except Exception as e:
+        logger.error(f"[Main] ❌ NCA 引擎初始化失敗: {e}")
+else:
+    logger.warning("[Main] 未設定 nca_checkpoint，NCA 模式不可用。")
+
+# ── 7. GUI ───────────────────────────────────────────────────────────────
+gui = ti.GUI("Rhino NCA Bridge", res=config["gui_res"])
+
+# ── 8. 全域狀態 ──────────────────────────────────────────────────────────
+current_mode = "sdf"  # "sdf" | "mask" | "nca"
+latest_polygons = []
+nca_steps_per_frame = config.get("nca_steps_per_frame", 4)
+
+# viz_mode 標籤（給 GUI 顯示）
+VIZ_MODE_LABELS = {
+    "velocity": "速度量值",
+    "vorticity": "渦度場",
+    "pressure": "壓力場",
+    "beaufort": "蒲氏風力",
+    "stress": "剪切應力",
+}
 
 
+# ────────────────────────────────────────────────────────────────────────
+# WebSocket 訊息處理
+# ────────────────────────────────────────────────────────────────────────
 async def ws_handler(websocket):
-    """處理 WebSocket 連線和訊息的非同步函式"""
     global current_mode, latest_polygons
     logger.info("客戶端已連線")
 
     try:
-        # 持續接收客戶端訊息
         async for message in websocket:
             try:
                 data = json.loads(message)
+                need_geo_update = False
 
-                # 標記是否需要刷新引擎
-                need_update = False
-
-                # 1. 處理幾何數據更新 (更新快取)
+                # ── A. 幾何更新 ──────────────────────────────────────────
                 if "polygons" in data:
                     latest_polygons = data["polygons"]
-                    need_update = True
+                    need_geo_update = True
 
-                # 2. 處理模式切換
+                # ── B. 主模式切換（sdf / mask / nca）────────────────────
                 if "mode" in data:
                     new_mode = data["mode"]
+                    if new_mode == "nca" and engine_nca is None:
+                        await websocket.send(
+                            json.dumps(
+                                {
+                                    "status": "error",
+                                    "msg": "NCA engine not available (missing checkpoint)",
+                                    "mode": current_mode,
+                                }
+                            )
+                        )
+                        continue
                     if new_mode != current_mode:
-                        logger.info(f"切換模式: {current_mode} -> {new_mode}")
+                        logger.info(f"主模式: {current_mode} → {new_mode}")
                         current_mode = new_mode
-                        # 模式改變時，必須強制刷新，讓新引擎計算現有幾何
-                        need_update = True
+                        need_geo_update = True  # 切換模式時強制以現有幾何刷新
 
-                # 3. 統一執行引擎更新
-                # 只要有收到多邊形 OR 切換了模式，且快取中有數據，就執行計算
-                if need_update and latest_polygons:
+                # ── C. 視覺化模式切換（viz_mode，只在 NCA 模式有效）─────
+                if "viz_mode" in data and engine_nca is not None:
+                    try:
+                        engine_nca.set_viz_mode(data["viz_mode"])
+                    except ValueError as e:
+                        logger.warning(f"[WS] 無效 viz_mode: {e}")
+
+                # ── D. 執行幾何計算 ──────────────────────────────────────
+                if need_geo_update and latest_polygons:
                     if current_mode == "sdf":
                         engine_sdf.update_geometry(latest_polygons)
-                    else:
+
+                    elif current_mode == "mask":
                         engine_mask.update_geometry(latest_polygons, {})
 
-                # 回傳狀態確認
-                await websocket.send(json.dumps({"status": "ok", "mode": current_mode}))
+                    elif current_mode == "nca" and engine_nca is not None:
+                        # 同時更新兩個幾何引擎，取出 numpy 陣列後重置 NCA seed
+                        engine_mask.update_geometry(latest_polygons, {})
+                        engine_sdf.update_geometry(latest_polygons)
+                        mask_np = engine_mask.mask_field.to_numpy()
+                        sdf_np = engine_sdf.sdf_field.to_numpy()
+                        engine_nca.reset_state(mask_np, sdf_np)
+
+                # ── E. 回傳確認 ──────────────────────────────────────────
+                response = {"status": "ok", "mode": current_mode}
+
+                if (
+                    current_mode == "nca"
+                    and engine_nca is not None
+                    and engine_nca._ready
+                ):
+                    stats = engine_nca.get_velocity_stats()
+                    response["stats"] = stats
+                    response["viz_mode"] = engine_nca.viz_mode
+
+                    # 每次幾何更新時附帶圖例（方便 GH 首次顯示色卡）
+                    if need_geo_update:
+                        response["beaufort_legend"] = engine_nca.beaufort_legend()
+
+                await websocket.send(json.dumps(response))
 
             except Exception as e:
-                logger.error(f"處理訊息時發生錯誤: {e}")
+                logger.error(f"處理訊息時發生錯誤: {e}", exc_info=True)
 
     except websockets.exceptions.ConnectionClosed:
         logger.info("客戶端已斷線")
 
 
+# ────────────────────────────────────────────────────────────────────────
+# 渲染迴圈
+# ────────────────────────────────────────────────────────────────────────
 async def render_loop():
-    """統一的渲染迴圈，負責更新 GUI 視窗"""
-    global current_mode
     while gui.running:
-        # 根據模式選擇要顯示的畫布
+
         if current_mode == "sdf":
             gui.set_image(engine_sdf.canvas)
-            gui.text(
-                "Mode: SDF (Signed Distance Field)",
-                pos=(0.05, 0.95),
-                color=0xFFFFFF,
-                font_size=20,
-            )
-        else:
+            gui.text("Mode: SDF", pos=(0.02, 0.97), color=0xFFFFFF, font_size=18)
+
+        elif current_mode == "mask":
             gui.set_image(engine_mask.canvas)
-            gui.text(
-                "Mode: Binary Mask (Union)",
-                pos=(0.05, 0.95),
-                color=0xFFFFFF,
-                font_size=20,
-            )
+            gui.text("Mode: Mask", pos=(0.02, 0.97), color=0xFFFFFF, font_size=18)
+
+        elif current_mode == "nca":
+            if engine_nca is not None and engine_nca._ready:
+                engine_nca.step(nca_steps_per_frame)
+                gui.set_image(engine_nca.canvas)
+
+                # 標題顯示目前的視覺化模式
+                viz_label = VIZ_MODE_LABELS.get(
+                    engine_nca.viz_mode, engine_nca.viz_mode
+                )
+                stats = engine_nca.get_velocity_stats()
+                bft = stats.get("beaufort_max", 0)
+                spd = stats.get("speed_max_ms", 0.0)
+                gui.text(
+                    f"NCA | {viz_label} | {spd:.1f} m/s | Bft {bft}",
+                    pos=(0.02, 0.97),
+                    color=0xFFFF00,
+                    font_size=18,
+                )
+            else:
+                gui.set_image(engine_sdf.canvas)
+                gui.text(
+                    "NCA: 等待幾何輸入...",
+                    pos=(0.02, 0.97),
+                    color=0xFF8800,
+                    font_size=18,
+                )
 
         gui.show()
         await asyncio.sleep(0.01)
 
 
+# ────────────────────────────────────────────────────────────────────────
+# 主函式
+# ────────────────────────────────────────────────────────────────────────
 async def main():
-    """主函式，啟動伺服器和渲染迴圈"""
     ws_host = config["ws_host"]
     ws_port = config["ws_port"]
-
     server = await websockets.serve(ws_handler, ws_host, ws_port)
     logger.info(f"伺服器已啟動於 ws://{ws_host}:{ws_port}")
-
+    logger.info(f"可用 viz_mode: {NCAEngine.available_viz_modes()}")
     await render_loop()
 
 
@@ -891,153 +959,496 @@ if __name__ == "__main__":
         pass
 
 --------------------------------------------------------------------------------------------
-main_註解版.py
-# 匯入必要的函式庫
-import taichi as ti  # 用於 GPU 計算和 GUI
-import asyncio  # 用於非同步 I/O，處理並行的網路和渲染
-import websockets  # 用於建立 WebSocket 伺服器
-import json  # 用於解析客戶端傳來的 JSON 訊息
-import logging  # 用於記錄伺服器狀態和錯誤
-import time  # 時間相關功能 (此處未使用)
-import numpy as np  # 用於數值計算 (主要用於和 Taichi 交換數據)
+nca_loader.py
+"""
+nca_loader.py
+跨 repo 載入 02-nca-cfd 訓練好的 .pth，回傳可直接推論的 model。
 
-# --- 1. 統一初始化 Taichi ---
-# ti.init() 是 Taichi 的啟動點，必須在使用任何 Taichi 功能前呼叫
-# arch=ti.gpu 指定計算後端為 GPU (例如 CUDA 或 Vulkan)，以獲得最佳效能
-ti.init(arch=ti.gpu)
+放置於：NCA_workspace/03-gh-frontend/src/nca_loader.py
+"""
+import sys
+import os
+import torch
+import logging
 
-# 從其他檔案匯入我們自定義的計算引擎
-from engine import ComputeEngine  # 匯入原始的二元遮罩 (Mask) 引擎
-from engine_sdf import SDFEngine  # 匯入新的符號距離場 (SDF) 引擎
-
-# --- 設定日誌記錄 ---
-# basicConfig 用於設定日誌的基本格式
-logging.basicConfig(
-    level=logging.INFO,  # 設定日誌級別為 INFO，表示只記錄 INFO, WARNING, ERROR, CRITICAL 等級的訊息
-    format="%(asctime)s [%(levelname)s] %(message)s"  # 設定日誌訊息的格式，包含時間、級別和訊息內容
-)
-# 建立一個名為 "RhinoBridge" 的日誌記錄器
 logger = logging.getLogger("RhinoBridge")
 
-# --- 初始化兩個引擎 ---
-# 注意：這兩個引擎會共享同一個由 ti.init() 建立的 Taichi "Context"。
-# 這表示它們可以在同一個 GPU 上運作，而不需要重新初始化。
-engine_mask = ComputeEngine(data_res=1024, gui_res=512)  # 建立遮罩引擎的實例，設定計算解析度和顯示解析度
-engine_sdf = SDFEngine(data_res=1024, gui_res=512)  # 建立 SDF 引擎的實例
 
-# --- 建立一個統一的 GUI 視窗 ---
-# ti.GUI() 建立一個 Taichi 的圖形使用者介面視窗
-# "Rhino Taichi Bridge" 是視窗的標題
-# res=512 設定視窗的解析度為 512x512 像素
-gui = ti.GUI("Rhino Taichi Bridge", res=512)
+def load_nca_model(checkpoint_path: str, nca_cfd_src: str = None):
+    """
+    從 02-nca-cfd 的 checkpoint 載入 LBMInspiredNCA。
 
-# --- 全域狀態變數 ---
-# 用於在不同的非同步函式之間共享狀態
-current_mode = "sdf"  # 預設模式為 'sdf'。可以是 'mask' 或 'sdf'
-latest_polygons = []  # 用於儲存從客戶端收到的最新多邊形幾何數據
+    Args:
+        checkpoint_path : .pth 的絕對路徑
+        nca_cfd_src     : 02-nca-cfd/src 的路徑。
+                          None → 自動從 monorepo 根目錄推算
 
+    Returns:
+        model           : eval() 模式，已搬到正確 device
+        model_cfg       : 原始 config["Model"] 字典
+        static_channels : int (通常 = 2)
+    """
 
-# --- WebSocket 訊息處理函式 ---
-# 當有客戶端連線時，這個非同步函式會被呼叫
-async def ws_handler(websocket):
-    # 使用 global 關鍵字來修改全域變數
-    global current_mode, latest_polygons
-    logger.info("客戶端已連線")
-
-    try:
-        # 使用 async for 迴圈來持續等待並接收來自客戶端的訊息
-        async for message in websocket:
-            try:
-                # 將收到的 JSON 字串訊息解析成 Python 的字典
-                data = json.loads(message)
-
-                # 1. 檢查訊息中是否包含 'mode' 鍵，用於切換計算模式
-                if "mode" in data:
-                    new_mode = data["mode"]  # 取得新的模式字串
-                    if new_mode != current_mode:  # 如果新模式和當前模式不同
-                        logger.info(f"切換模式: {current_mode} -> {new_mode}")
-                        current_mode = new_mode  # 更新全域的模式狀態
-
-                # 2. 檢查訊息中是否包含 'polygons' 鍵，用於更新幾何數據
-                if "polygons" in data:
-                    polygons = data["polygons"]  # 取得多邊形列表
-                    latest_polygons = polygons  # 更新全域的幾何數據快取
-
-                    # 3. 根據當前的模式，將幾何數據分派給對應的引擎進行計算
-                    if current_mode == "sdf":
-                        engine_sdf.update_geometry(polygons)  # 呼叫 SDF 引擎的更新函式
-                    else:
-                        engine_mask.update_geometry(polygons, {})  # 呼叫遮罩引擎的更新函式
-
-                # 向客戶端回傳一個確認訊息，告知目前狀態和模式
-                await websocket.send(json.dumps({"status": "ok", "mode": current_mode}))
-
-            except Exception as e:
-                # 如果在處理單一訊息時發生錯誤，記錄錯誤但保持連線
-                logger.error(f"處理訊息時發生錯誤: {e}")
-
-    except websockets.exceptions.ConnectionClosed:
-        # 如果客戶端斷開連線，記錄訊息
-        logger.info("客戶端已斷線")
-
-
-# --- 圖形渲染迴圈 ---
-async def render_loop():
-    """統一的渲染循環，負責將計算結果畫在 GUI 視窗上"""
-    global current_mode
-    # 當 GUI 視窗沒有被關閉時，持續執行
-    while gui.running:
-        # 根據當前的模式決定要渲染哪個引擎的畫布
-        if current_mode == "sdf":
-            # 從 SDF 引擎取得渲染好的畫布 (一個 Taichi field)
-            gui.set_image(engine_sdf.canvas)
-            # 在 GUI 視窗的左上角顯示目前的模式文字
-            gui.text(
-                "模式: SDF (符號距離場)",
-                pos=(0.05, 0.95),  # 位置 (x, y)，範圍是 0.0 到 1.0
-                color=0xFFFFFF,  # 顏色 (白色)
-                font_size=20,  # 字體大小
-            )
-        else:
-            # 從遮罩引擎取得渲染好的畫布
-            gui.set_image(engine_mask.canvas)
-            # 在 GUI 視窗上顯示模式文字
-            gui.text(
-                "模式: 二元遮罩 (聯集)",
-                pos=(0.05, 0.95),
-                color=0xFFFFFF,
-                font_size=20,
+    # ── 1. 找到並注入 02-nca-cfd/src ──────────────────────────────────────
+    if nca_cfd_src is None:
+        # 從 checkpoint 路徑往上找到 NCA_workspace 根目錄
+        # 預期結構：NCA_workspace/02-nca-cfd/train_log/MMDD_N/model_latest.pth
+        ckpt_abs = os.path.abspath(checkpoint_path)
+        candidate = os.path.dirname(ckpt_abs)
+        found = False
+        for _ in range(8):
+            candidate = os.path.dirname(candidate)
+            maybe = os.path.join(candidate, "02-nca-cfd", "src")
+            if os.path.isdir(maybe):
+                nca_cfd_src = maybe
+                found = True
+                break
+        if not found:
+            raise FileNotFoundError(
+                f"找不到 02-nca-cfd/src，請手動設定 nca_cfd_src 參數。\n"
+                f"從 checkpoint 路徑向上搜尋: {ckpt_abs}"
             )
 
-        # 將畫布內容顯示在視窗上
-        gui.show()
-        # 等待一小段時間 (0.01秒)，釋放 CPU 資源，並讓其他非同步任務有機會執行
-        await asyncio.sleep(0.01)
+    if nca_cfd_src not in sys.path:
+        sys.path.insert(0, nca_cfd_src)
+        logger.info(f"[Loader] sys.path 已加入: {nca_cfd_src}")
+
+    # ── 2. 載入 checkpoint ──────────────────────────────────────────────
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    checkpoint = torch.load(
+        checkpoint_path, map_location=device, weights_only=False
+    )
+    logger.info(f"[Loader] 讀取 checkpoint: {checkpoint_path}  (step={checkpoint.get('step', '?')})")
+
+    # ── 3. 解析 config ──────────────────────────────────────────────────
+    config = checkpoint.get("config", {})
+    model_cfg = config.get("Model", {})
+    pool_cfg  = config.get("RollingPool", {})
+
+    # 補齊預設值（對應 config_desktop.yaml 的常見設定）
+    model_cfg.setdefault("nca_channels",      32)
+    model_cfg.setdefault("hidden_n",          96)
+    model_cfg.setdefault("learnable_filters", 16)
+    model_cfg.setdefault("num_groups",         8)
+    static_channels = pool_cfg.get("static_channels", 2)
+
+    # ── 4. 建立模型並載入權重 ───────────────────────────────────────────
+    from models.LBMInspiredNCA import LBMInspiredNCA  # noqa
+
+    model = LBMInspiredNCA(model_cfg, static_channels=static_channels)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.to(device)
+    model.eval()
+
+    logger.info(
+        f"[Loader] ✅ 模型載入成功 | "
+        f"channels={model_cfg['nca_channels']} | "
+        f"hidden={model_cfg['hidden_n']} | "
+        f"static_ch={static_channels} | "
+        f"device={device}"
+    )
+    return model, model_cfg, static_channels
+
+--------------------------------------------------------------------------------------------
+physics_colorizer.py
+"""
+physics_colorizer.py
+NCA 推論結果後處理：從 state[:11] 提取物理量並轉換為 RGB 影像。
+
+放置於：NCA_workspace/03-gh-frontend/src/physics_colorizer.py
+
+支援五種視覺化模式（可即時切換）：
+  "velocity"  - 速度量值       (plasma)
+  "vorticity" - 渦度場          (自訂黃橘黑綠青)
+  "pressure"  - 壓力場          (RdBu_r)
+  "beaufort"  - 蒲氏風力級數   (12 級離散色階)
+  "stress"    - 剪切應力 pxy   (coolwarm)
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")   # 無頭後端，不開視窗
+from matplotlib import cm
+from matplotlib.colors import Normalize, LinearSegmentedColormap, BoundaryNorm
+from typing import Optional
+from numpy.typing import NDArray
 
 
-# --- 主函式 ---
-async def main():
-    # 建立並啟動 WebSocket 伺服器
-    # websockets.serve() 會回傳一個伺服器物件
-    # ws_handler 是處理每個連線的函式
-    # "localhost" 和 8765 是伺服器的位址和埠號
-    server = await websockets.serve(ws_handler, "localhost", 8765)
-    logger.info("伺服器已啟動於 ws://localhost:8765")
+# ══════════════════════════════════════════════════════════════════════════════
+# 蒲氏風力級數定義
+# ══════════════════════════════════════════════════════════════════════════════
 
-    # 並行執行渲染迴圈
-    # 這裡 `await` 會等待 render_loop 結束，也就是 GUI 視窗被關閉
-    await render_loop()
+# 各級上限速度 (m/s)，第 12 級無上限
+BEAUFORT_LIMITS_MS: list[float] = [
+    0.3,   # 0 → 1
+    1.5,   # 1 → 2
+    3.3,   # 2 → 3
+    5.5,   # 3 → 4
+    7.9,   # 4 → 5
+    10.7,  # 5 → 6
+    13.8,  # 6 → 7
+    17.1,  # 7 → 8
+    20.7,  # 8 → 9
+    24.4,  # 9 → 10
+    28.4,  # 10 → 11
+    32.6,  # 11 → 12
+    999.0, # 12 上限（颶風）
+]
+
+BEAUFORT_LABELS: list[str] = [
+    "0 靜風", "1 軟風", "2 輕風", "3 微風",
+    "4 和風", "5 清風", "6 強風", "7 疾風",
+    "8 大風", "9 烈風", "10 狂風", "11 暴風", "12 颶風",
+]
+
+# 13 個邊界 = 12 個區間
+BEAUFORT_BOUNDS: NDArray = np.array([0.0] + BEAUFORT_LIMITS_MS)
+
+# 每級顏色（RGB 0-1），從冷色→暖色→紅→紫，讓建築師一眼看出危險程度
+BEAUFORT_COLORS: list[tuple[float, float, float]] = [
+    (0.90, 0.97, 1.00),  # 0  靜風   淡水藍
+    (0.68, 0.88, 0.98),  # 1  軟風   天藍
+    (0.40, 0.76, 0.96),  # 2  輕風   藍
+    (0.20, 0.63, 0.86),  # 3  微風   中藍
+    (0.16, 0.84, 0.66),  # 4  和風   青綠
+    (0.31, 0.93, 0.31),  # 5  清風   翠綠
+    (0.88, 0.93, 0.13),  # 6  強風   黃
+    (1.00, 0.75, 0.02),  # 7  疾風   橙黃
+    (1.00, 0.48, 0.00),  # 8  大風   橙
+    (0.96, 0.22, 0.06),  # 9  烈風   紅橙
+    (0.80, 0.04, 0.04),  # 10 狂風   深紅
+    (0.58, 0.00, 0.58),  # 11 暴風   紫
+    (0.25, 0.00, 0.35),  # 12 颶風   深紫
+]
+
+def _build_beaufort_cmap() -> tuple[LinearSegmentedColormap, BoundaryNorm]:
+    """建立 13 色離散 Colormap 與對應的 BoundaryNorm。"""
+    cmap = LinearSegmentedColormap.from_list(
+        "beaufort", BEAUFORT_COLORS, N=13
+    )
+    cmap.set_bad(color=(0.4, 0.4, 0.4))    # NaN → 深灰（固體）
+    norm = BoundaryNorm(BEAUFORT_BOUNDS, ncolors=13)
+    return cmap, norm
 
 
-# --- 程式進入點 ---
-# 這是 Python 腳本的標準啟動方式
-if __name__ == "__main__":
-    try:
-        # asyncio.run() 是啟動非同步程式的進入點
-        # 它會執行傳入的 main() 函式，並管理整個事件迴圈
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        # 如果使用者按下 Ctrl+C，程式會在這裡捕捉到 KeyboardInterrupt 異常
-        # pass 表示什麼都不做，讓程式乾淨地退出
-        pass
+def _build_vorticity_cmap() -> LinearSegmentedColormap:
+    """渦度：負渦（順時針）→黃橘，中心黑，正渦（逆時針）→綠青"""
+    colors = [
+        (1.00, 1.00, 0.00),   # 強負渦  黃
+        (0.95, 0.49, 0.02),   # 負渦    橙
+        (0.00, 0.00, 0.00),   # 零      黑
+        (0.18, 0.98, 0.53),   # 正渦    翠綠
+        (0.00, 1.00, 1.00),   # 強正渦  青
+    ]
+    cmap = LinearSegmentedColormap.from_list("vorticity_cmap", colors)
+    cmap.set_bad(color=(0.5, 0.5, 0.5))
+    return cmap
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 內部通用映射工具
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _apply_colormap(
+    data: NDArray[np.float32],
+    cmap: matplotlib.colors.Colormap,
+    norm: matplotlib.colors.Normalize,
+    mask: Optional[NDArray] = None,
+    obstacle_gray: float = 0.35,
+) -> NDArray[np.float32]:
+    """
+    通用：把 [H, W] float 陣列映射為 [H, W, 3] float32 RGB。
+    mask: 1=固體，0=流體。固體像素統一設為 obstacle_gray 深灰。
+    """
+    plot_data = data.copy()
+    if mask is not None:
+        plot_data[mask > 0.5] = np.nan     # 讓 cmap.set_bad 處理
+
+    mapper = cm.ScalarMappable(norm=norm, cmap=cmap)
+    rgba = mapper.to_rgba(plot_data)       # [H, W, 4] float64
+    rgb  = rgba[:, :, :3].astype(np.float32)
+
+    if mask is not None:
+        rgb[mask > 0.5] = obstacle_gray    # 固體強制覆蓋為深灰（銳利邊界）
+
+    return rgb
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 物理量提取（從 NCA state [1, 11, H, W] 或 [11, H, W]）
+# ══════════════════════════════════════════════════════════════════════════════
+
+class PhysicsFields:
+    """從 NCA state 提取並快取所有衍生物理量，避免重複計算。"""
+
+    # Channel layout (訓練時約定)
+    CH_MASK = 0;  CH_SDF = 1
+    CH_RHO  = 2;  CH_E   = 3;  CH_EPS = 4
+    CH_JX   = 5;  CH_QX  = 6
+    CH_JY   = 7;  CH_QY  = 8
+    CH_PXX  = 9;  CH_PXY = 10
+
+    def __init__(
+        self,
+        state_np: NDArray[np.float32],
+        lbm_to_ms: float = 10.0,
+    ):
+        """
+        Args:
+            state_np  : [11, H, W] 或 [1, 11, H, W] 的 numpy 陣列
+            lbm_to_ms : LBM 單位速度 → m/s 的換算係數
+                        （例：lbm u=1.0 對應 lbm_to_ms m/s）
+                        根據實際模型和風洞縮尺比設定。
+        """
+        if state_np.ndim == 4:
+            state_np = state_np[0]              # [11, H, W]
+        assert state_np.shape[0] >= 11, "至少需要 11 個通道"
+
+        self.lbm_to_ms = lbm_to_ms
+        s = state_np                            # alias
+
+        # ── 靜態場 ──────────────────────────────────────────────────────
+        self.mask: NDArray = (s[self.CH_MASK] > 0.5).astype(np.float32)  # [H,W] 0/1
+        self.sdf:  NDArray = s[self.CH_SDF]
+
+        # ── LBM Moments ─────────────────────────────────────────────────
+        self.rho: NDArray = s[self.CH_RHO]
+        self.jx:  NDArray = s[self.CH_JX]
+        self.jy:  NDArray = s[self.CH_JY]
+        self.pxx: NDArray = s[self.CH_PXX]
+        self.pxy: NDArray = s[self.CH_PXY]
+
+        # ── 衍生量（延遲計算） ──────────────────────────────────────────
+        self._ux: NDArray | None = None
+        self._uy: NDArray | None = None
+        self._speed_lbm:  NDArray | None = None
+        self._speed_ms:   NDArray | None = None
+        self._vorticity:  NDArray | None = None
+        self._pressure:   NDArray | None = None
+
+    @property
+    def ux(self) -> NDArray:
+        if self._ux is None:
+            safe_rho = np.clip(self.rho, 1e-2, None)
+            self._ux = np.clip(self.jx / safe_rho, -5.0, 5.0)
+        return self._ux
+
+    @property
+    def uy(self) -> NDArray:
+        if self._uy is None:
+            safe_rho = np.clip(self.rho, 1e-2, None)
+            self._uy = np.clip(self.jy / safe_rho, -5.0, 5.0)
+        return self._uy
+
+    @property
+    def speed_lbm(self) -> NDArray:
+        """速度量值（LBM 單位）"""
+        if self._speed_lbm is None:
+            self._speed_lbm = np.sqrt(self.ux**2 + self.uy**2)
+        return self._speed_lbm
+
+    @property
+    def speed_ms(self) -> NDArray:
+        """速度量值（m/s，乘以換算係數）"""
+        if self._speed_ms is None:
+            self._speed_ms = self.speed_lbm * self.lbm_to_ms
+        return self._speed_ms
+
+    @property
+    def vorticity(self) -> NDArray:
+        """
+        Z 軸渦度 ω = ∂uy/∂x - ∂ux/∂y
+        使用 numpy.gradient（中央差分），固體內部渦度設 0。
+        """
+        if self._vorticity is None:
+            duy_dx = np.gradient(self.uy, axis=1)
+            dux_dy = np.gradient(self.ux, axis=0)
+            w = duy_dx - dux_dy
+            w[self.mask > 0.5] = 0.0           # 固體無渦度
+            self._vorticity = w
+        return self._vorticity
+
+    @property
+    def pressure(self) -> NDArray:
+        """
+        壓力 p = rho * cs²，其中 cs² = 1/3（D2Q9 標準值）。
+        返回相對於流場平均值的偏差（突出高低壓區）。
+        """
+        if self._pressure is None:
+            p = self.rho / 3.0
+            fluid_mask = 1.0 - self.mask
+            fluid_mean = (p * fluid_mask).sum() / (fluid_mask.sum() + 1e-8)
+            self._pressure = (p - fluid_mean) * fluid_mask
+        return self._pressure
+
+    def beaufort_scale(self) -> NDArray[np.int8]:
+        """每個像素的蒲氏風力級數 (0-12)。"""
+        spd = self.speed_ms
+        scale = np.zeros_like(spd, dtype=np.int8)
+        for level, upper in enumerate(BEAUFORT_LIMITS_MS[:-1]):
+            scale[spd >= upper] = level + 1
+        scale[self.mask > 0.5] = -1   # 固體設 -1，渲染時特別處理
+        return scale
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 公開彩色化函數
+# ══════════════════════════════════════════════════════════════════════════════
+
+def colorize_velocity(
+    fields: PhysicsFields,
+    u_max: Optional[float] = None,
+    cmap_name: str = "plasma",
+) -> NDArray[np.float32]:
+    """
+    速度量值熱力圖。
+    u_max: LBM 單位的上限速度（None → 自動取場最大值）。
+    """
+    spd  = fields.speed_lbm
+    vmax = u_max if u_max is not None else float(np.percentile(spd[fields.mask < 0.5], 98))
+    vmax = max(vmax, 1e-6)
+    norm = Normalize(vmin=0, vmax=vmax)
+    cmap = cm.get_cmap(cmap_name)
+    cmap.set_bad(color=(0.35, 0.35, 0.35))
+    return _apply_colormap(spd, cmap, norm, mask=fields.mask)
+
+
+def colorize_vorticity(
+    fields: PhysicsFields,
+    vorticity_range: Optional[float] = None,
+) -> NDArray[np.float32]:
+    """
+    渦度場（正渦=逆時針=青綠，負渦=順時針=黃橘，零=黑）。
+    vorticity_range: 對稱截斷值（None → 自動 98th 百分位）。
+    """
+    w = fields.vorticity
+    if vorticity_range is None:
+        fluid_w = w[fields.mask < 0.5]
+        vorticity_range = float(np.percentile(np.abs(fluid_w), 98)) + 1e-6
+    norm = Normalize(vmin=-vorticity_range, vmax=vorticity_range)
+    cmap = _build_vorticity_cmap()
+    return _apply_colormap(w, cmap, norm, mask=fields.mask)
+
+
+def colorize_pressure(
+    fields: PhysicsFields,
+    p_range: Optional[float] = None,
+) -> NDArray[np.float32]:
+    """
+    壓力偏差場（紅=高壓，藍=低壓，白=平均）。
+    """
+    p = fields.pressure
+    if p_range is None:
+        fluid_p = p[fields.mask < 0.5]
+        p_range = float(np.percentile(np.abs(fluid_p), 98)) + 1e-6
+    norm = Normalize(vmin=-p_range, vmax=p_range)
+    cmap = cm.get_cmap("RdBu_r")
+    cmap.set_bad(color=(0.35, 0.35, 0.35))
+    return _apply_colormap(p, cmap, norm, mask=fields.mask)
+
+
+def colorize_stress(
+    fields: PhysicsFields,
+    stress_range: Optional[float] = None,
+) -> NDArray[np.float32]:
+    """
+    剪切應力 pxy（coolwarm，建築結構風壓參考用）。
+    """
+    pxy = fields.pxy.copy()
+    pxy[fields.mask > 0.5] = 0.0
+    if stress_range is None:
+        fluid_pxy = pxy[fields.mask < 0.5]
+        stress_range = float(np.percentile(np.abs(fluid_pxy), 98)) + 1e-6
+    norm = Normalize(vmin=-stress_range, vmax=stress_range)
+    cmap = cm.get_cmap("coolwarm")
+    cmap.set_bad(color=(0.35, 0.35, 0.35))
+    return _apply_colormap(pxy, cmap, norm, mask=fields.mask)
+
+
+def colorize_beaufort(
+    fields: PhysicsFields,
+) -> NDArray[np.float32]:
+    """
+    蒲氏風力級數離散上色。
+    固體像素 → 深灰；0-12 級 → 各自代表色。
+    """
+    spd_ms = fields.speed_ms
+    cmap, norm = _build_beaufort_cmap()
+    cmap.set_bad(color=(0.35, 0.35, 0.35))
+
+    # 固體設 NaN
+    plot_spd = spd_ms.copy()
+    plot_spd[fields.mask > 0.5] = np.nan
+
+    mapper = cm.ScalarMappable(norm=norm, cmap=cmap)
+    rgba = mapper.to_rgba(plot_spd)
+    rgb  = rgba[:, :, :3].astype(np.float32)
+    rgb[fields.mask > 0.5] = 0.35       # 固體深灰
+
+    return rgb
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 統一分派器
+# ══════════════════════════════════════════════════════════════════════════════
+
+VIZ_MODES = ["velocity", "vorticity", "pressure", "beaufort", "stress"]
+
+def colorize(
+    state_np: NDArray[np.float32],
+    mode: str = "velocity",
+    lbm_to_ms: float = 10.0,
+    **kwargs,
+) -> NDArray[np.float32]:
+    """
+    統一入口：從 NCA state [11, H, W] 或 [1, 11, H, W] 產生 [H, W, 3] RGB。
+
+    Args:
+        state_np  : NCA 輸出的前 11 通道（含 mask/SDF + 9 moments）
+        mode      : "velocity" | "vorticity" | "pressure" | "beaufort" | "stress"
+        lbm_to_ms : LBM 單位 → m/s 換算係數（Beaufort 需要 m/s）
+        **kwargs  : 傳遞給各個 colorize_* 函數的選用參數
+
+    Returns:
+        [H, W, 3] float32 RGB，值域 [0, 1]
+    """
+    fields = PhysicsFields(state_np, lbm_to_ms=lbm_to_ms)
+
+    if mode == "velocity":
+        return colorize_velocity(fields, **kwargs)
+    elif mode == "vorticity":
+        return colorize_vorticity(fields, **kwargs)
+    elif mode == "pressure":
+        return colorize_pressure(fields, **kwargs)
+    elif mode == "beaufort":
+        return colorize_beaufort(fields)
+    elif mode == "stress":
+        return colorize_stress(fields, **kwargs)
+    else:
+        raise ValueError(f"未知的視覺化模式: '{mode}'，可用: {VIZ_MODES}")
+
+
+def get_beaufort_legend() -> list[dict]:
+    """
+    回傳蒲氏級數圖例列表，供前端/GH 顯示色卡說明。
+
+    Returns:
+        [{"level": 0, "label": "0 靜風", "color_rgb": [0.90, 0.97, 1.00], "max_ms": 0.3}, ...]
+    """
+    legend = []
+    for i, (label, color, upper) in enumerate(
+        zip(BEAUFORT_LABELS, BEAUFORT_COLORS, BEAUFORT_LIMITS_MS)
+    ):
+        legend.append({
+            "level":    i,
+            "label":    label,
+            "color_rgb": list(color),
+            "color_hex": "#{:02X}{:02X}{:02X}".format(
+                int(color[0]*255), int(color[1]*255), int(color[2]*255)
+            ),
+            "max_ms":   upper if upper < 999 else None,
+        })
+    return legend
 
