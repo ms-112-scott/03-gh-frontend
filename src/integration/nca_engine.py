@@ -24,7 +24,11 @@ import taichi as ti
 import torch
 
 import cv2
-from physics_colorizer import colorize, VIZ_MODES, get_beaufort_legend
+from src.visualization.physics_colorizer import (
+    VIZ_MODES,
+    colorize,
+    get_beaufort_legend,
+)
 
 logger = logging.getLogger("RhinoBridge")
 
@@ -300,7 +304,7 @@ class NCAEngine:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _ms_to_beaufort(speed_ms: float) -> int:
-    from physics_colorizer import BEAUFORT_LIMITS_MS
+    from src.visualization.physics_colorizer import BEAUFORT_LIMITS_MS
     for level, upper in enumerate(BEAUFORT_LIMITS_MS):
         if speed_ms < upper:
             return level

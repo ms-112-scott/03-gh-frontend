@@ -19,20 +19,21 @@ import json
 import logging
 import numpy as np
 import yaml
+from pathlib import Path
 
 # ── 1. 設定檔 ─────────────────────────────────────────────────────────────────
-CONFIG_PATH = "C:/Users/GAI/Desktop/NCA_workspace/03-gh-frontend/config.yaml"
-with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+CONFIG_PATH = Path(__file__).resolve().parents[2] / "config.yaml"
+with CONFIG_PATH.open("r", encoding="utf-8") as f:
     config = yaml.safe_load(f)
 
 # ── 2. 統一初始化 Taichi ──────────────────────────────────────────────────────
 ti.init(arch=ti.gpu)
 
 # ── 3. 匯入引擎 ───────────────────────────────────────────────────────────────
-from engine     import ComputeEngine
-from engine_sdf import SDFEngine
-from engine_nca import NCAEngine
-from nca_loader import load_model          # ← 統一入口（自動偵測 VAENCA / LBM）
+from src.middleware.mask_engine import ComputeEngine
+from src.middleware.sdf_engine import SDFEngine
+from src.integration.nca_engine import NCAEngine
+from src.integration.nca_loader import load_model
 
 # ── 4. 日誌 ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -246,8 +247,12 @@ async def main():
     await render_loop()
 
 
-if __name__ == "__main__":
+def run() -> None:
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
+
+
+if __name__ == "__main__":
+    run()
