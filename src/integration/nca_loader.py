@@ -1,211 +1,184 @@
-"""
-nca_loader.py
-=============
-跨 repo 載入 02-nca-cfd 訓練好的 .pth，回傳可直接推論的 model。
+from __future__ import annotations
 
-支援：
-  - VAENCA         (新) : checkpoint["config"] 含 "VAENCA" 區段
-  - LBMInspiredNCA (舊) : checkpoint["config"] 含 "Model"  區段（向下相容）
-
-統一入口 → load_model(checkpoint_path)
-回傳 ModelInfo TypedDict，供 main.py 與 NCAEngine 使用。
-"""
-
-import os
-import sys
+import importlib
+import inspect
 import logging
-from typing import TypedDict
+import sys
+from pathlib import Path
+from typing import Any, Mapping, TypedDict
 
 import torch
-import torch.nn as nn
+
 
 logger = logging.getLogger("RhinoBridge")
+FRONTEND_ROOT = Path(__file__).resolve().parents[2]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 回傳格式定義
-# ─────────────────────────────────────────────────────────────────────────────
-
-class ModelInfo(TypedDict):
-    model:           nn.Module   # eval mode，已搬到正確 device
-    model_type:      str         # "vaenca" | "lbm_inspired"
-    total_channels:  int         # NCA 狀態總通道數 (VAENCA=32, LBM 依 config)
-    static_channels: int         # 靜態通道 (通常=2)
-    phy_channels:    int         # 物理矩通道 (通常=9)
+class PipelineInfo(TypedDict):
+    pipeline: Any
+    backend_root: str
+    rans_checkpoint_dir: str
+    inference_config_path: str | None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 路徑工具
-# ─────────────────────────────────────────────────────────────────────────────
+def _resolve_frontend_relative(path_value: str) -> Path:
+    path = Path(path_value)
+    if path.is_absolute():
+        return path.resolve()
 
-def _find_nca_cfd_src(checkpoint_path: str, override: str | None = None) -> str:
-    """
-    從 checkpoint 路徑向上搜尋 02-nca-cfd/src。
-    預期 monorepo 結構：
-        NCA_workspace/
-            02-nca-cfd/
-                src/
-                train_log/.../vaenca_model_final_*.pth
-            03-gh-frontend/
-                src/
-    """
-    if override:
-        return override
+    candidates = [
+        (FRONTEND_ROOT / "src" / path).resolve(),
+        (FRONTEND_ROOT / path).resolve(),
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
 
-    ckpt_abs  = os.path.abspath(checkpoint_path)
-    candidate = os.path.dirname(ckpt_abs)
-    for _ in range(10):
-        candidate = os.path.dirname(candidate)
-        maybe = os.path.join(candidate, "02-nca-cfd", "src")
-        if os.path.isdir(maybe):
-            return maybe
+
+def _resolve_checkpoint_file(path_value: str) -> Path:
+    checkpoint_path = _resolve_frontend_relative(path_value)
+    if checkpoint_path.exists():
+        return checkpoint_path
+
+    parent = checkpoint_path.parent
+    if not parent.exists():
+        return checkpoint_path
+
+    preferred_matches = sorted(parent.glob(f"{checkpoint_path.stem.replace('_latest', '')}*.pth"))
+    if preferred_matches:
+        return preferred_matches[-1]
+
+    generic_matches = sorted(parent.glob("*.pth"))
+    if generic_matches:
+        return generic_matches[-1]
+
+    return checkpoint_path
+
+
+def _resolve_repo_root_from_checkpoint(checkpoint_path: str) -> Path:
+    ckpt_path = Path(checkpoint_path).resolve()
+    for parent in [ckpt_path.parent, *ckpt_path.parents]:
+        if parent.name == "02-nca-cfd":
+            return parent
+    raise FileNotFoundError(
+        f"Unable to infer 02-nca-cfd root from checkpoint path: {checkpoint_path}"
+    )
+
+
+def _resolve_repo_root(frontend_config: Mapping[str, Any]) -> Path:
+    nca_cfd_src = frontend_config.get("nca_cfd_src")
+    if nca_cfd_src:
+        src_path = _resolve_frontend_relative(str(nca_cfd_src))
+        if src_path.name == "src":
+            return src_path.parent
+        return src_path
+
+    checkpoint_path = frontend_config.get("nca_checkpoint")
+    if checkpoint_path:
+        return _resolve_repo_root_from_checkpoint(str(_resolve_checkpoint_file(str(checkpoint_path))))
+
+    backend_root = frontend_config.get("nca_cfd_root")
+    if backend_root:
+        return Path(str(backend_root)).resolve()
 
     raise FileNotFoundError(
-        f"找不到 02-nca-cfd/src。請在 config.yaml 的 nca_cfd_src 手動指定路徑。\n"
-        f"搜尋起點：{ckpt_abs}"
+        "Missing backend location. Set one of: nca_cfd_src, nca_checkpoint, nca_cfd_root."
     )
 
 
-def _inject_src(src_path: str) -> None:
-    if src_path not in sys.path:
-        sys.path.insert(0, src_path)
-        logger.info(f"[Loader] sys.path += {src_path}")
+def _inject_backend_repo(backend_root: Path) -> None:
+    backend_root_str = str(backend_root)
+    if backend_root_str not in sys.path:
+        sys.path.insert(0, backend_root_str)
+        logger.info("[Loader] sys.path += %s", backend_root_str)
+
+    backend_src = backend_root / "src"
+    if backend_src.is_dir():
+        import src as frontend_src  # noqa: E402
+
+        backend_src_str = str(backend_src)
+        if backend_src_str not in frontend_src.__path__:
+            frontend_src.__path__.append(backend_src_str)
+            logger.info("[Loader] frontend src namespace += %s", backend_src_str)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# VAENCA 載入
-# ─────────────────────────────────────────────────────────────────────────────
+def _resolve_rans_checkpoint_dir(frontend_config: Mapping[str, Any]) -> str:
+    checkpoint_dir = frontend_config.get("rans_checkpoint_dir")
+    if checkpoint_dir:
+        return str(_resolve_frontend_relative(str(checkpoint_dir)))
 
-def _load_vaenca(
-    checkpoint: dict,
-    device:     torch.device,
-    src_path:   str,
-) -> ModelInfo:
-    """從已解析的 checkpoint dict 建立 VAENCA 並載入權重。"""
-    _inject_src(src_path)
-    from models.VAENCA import VAENCA  # noqa: E402  (動態注入後才可 import)
+    checkpoint_path = frontend_config.get("nca_checkpoint")
+    if checkpoint_path:
+        return str(_resolve_checkpoint_file(str(checkpoint_path)).parent)
 
-    vaenca_cfg = checkpoint["config"]["VAENCA"]
-
-    # 補齊舊版 checkpoint 可能缺少的欄位
-    vaenca_cfg.setdefault("static_channels",   2)
-    vaenca_cfg.setdefault("phy_channels",      9)
-    vaenca_cfg.setdefault("hidden_channels",  21)
-    vaenca_cfg.setdefault("hidden_dim",       32)
-    vaenca_cfg.setdefault("nca_hidden",      128)
-    vaenca_cfg.setdefault("learnable_filters", 16)
-    vaenca_cfg.setdefault("hormone_dim",        4)
-    vaenca_cfg.setdefault("fire_rate",        0.5)
-
-    model = VAENCA(vaenca_cfg)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.to(device).eval()
-
-    static_ch = int(vaenca_cfg["static_channels"])
-    phy_ch    = int(vaenca_cfg["phy_channels"])
-    total_ch  = model.total_channels
-
-    logger.info(
-        f"[Loader] ✅ VAENCA | step={checkpoint.get('step','?')} | "
-        f"total_ch={total_ch} | static={static_ch} | phy={phy_ch} | device={device}"
-    )
-    return ModelInfo(
-        model=model,
-        model_type="vaenca",
-        total_channels=total_ch,
-        static_channels=static_ch,
-        phy_channels=phy_ch,
+    raise FileNotFoundError(
+        "Missing RANS checkpoint location. Set rans_checkpoint_dir or nca_checkpoint."
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# LBMInspiredNCA 載入（向下相容）
-# ─────────────────────────────────────────────────────────────────────────────
+def load_inference_pipeline(frontend_config: Mapping[str, Any]) -> PipelineInfo:
+    backend_root = _resolve_repo_root(frontend_config)
+    _inject_backend_repo(backend_root)
 
-def _load_lbm_inspired(
-    checkpoint: dict,
-    device:     torch.device,
-    src_path:   str,
-) -> ModelInfo:
-    """從已解析的 checkpoint dict 建立 LBMInspiredNCA 並載入權重。"""
-    _inject_src(src_path)
-    from models.LBMInspiredNCA import LBMInspiredNCA  # noqa: E402
+    explicit_checkpoint: str | None = None
+    if frontend_config.get("nca_checkpoint"):
+        explicit_checkpoint = str(_resolve_checkpoint_file(str(frontend_config["nca_checkpoint"])))
+        base_module = importlib.import_module("inference.BaseModuleEngine")
+        original_find_checkpoint = base_module.BaseModuleEngine._find_checkpoint
 
-    cfg       = checkpoint["config"]
-    model_cfg = cfg.get("Model", {})
-    pool_cfg  = cfg.get("RollingPool", {})
+        def _patched_find_checkpoint(ckpt_dir: str) -> str:
+            if explicit_checkpoint is not None:
+                explicit_path = Path(explicit_checkpoint).resolve()
+                if explicit_path.parent == Path(ckpt_dir).resolve():
+                    return str(explicit_path)
+            return original_find_checkpoint(ckpt_dir)
 
-    model_cfg.setdefault("nca_channels",      32)
-    model_cfg.setdefault("hidden_n",          96)
-    model_cfg.setdefault("learnable_filters", 16)
-    model_cfg.setdefault("num_groups",         8)
-    static_ch = int(pool_cfg.get("static_channels", 2))
+        base_module.BaseModuleEngine._find_checkpoint = staticmethod(_patched_find_checkpoint)
 
-    model = LBMInspiredNCA(model_cfg, static_channels=static_ch)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.to(device).eval()
+    from inference import InferencePipeline  # noqa: E402
 
-    total_ch = int(model_cfg["nca_channels"])
-    logger.info(
-        f"[Loader] ✅ LBMInspiredNCA | step={checkpoint.get('step','?')} | "
-        f"total_ch={total_ch} | static={static_ch} | device={device}"
-    )
-    return ModelInfo(
-        model=model,
-        model_type="lbm_inspired",
-        total_channels=total_ch,
-        static_channels=static_ch,
-        phy_channels=9,
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 公開統一入口
-# ─────────────────────────────────────────────────────────────────────────────
-
-def load_model(
-    checkpoint_path: str,
-    nca_cfd_src:     str | None = None,
-    device:          torch.device | None = None,
-) -> ModelInfo:
-    """
-    自動偵測 checkpoint 類型並載入對應模型。
-
-    Args:
-        checkpoint_path : .pth 絕對路徑
-        nca_cfd_src     : 02-nca-cfd/src 路徑（None → 從路徑自動推算）
-        device          : None → 自動選 CUDA / CPU
-
-    Returns:
-        ModelInfo TypedDict（model, model_type, total_channels,
-                             static_channels, phy_channels）
-    """
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    logger.info(f"[Loader] 載入 checkpoint：{checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-
-    src_path = _find_nca_cfd_src(checkpoint_path, nca_cfd_src)
-    cfg      = checkpoint.get("config", {})
-
-    if "VAENCA" in cfg:
-        return _load_vaenca(checkpoint, device, src_path)
-    elif "Model" in cfg:
-        return _load_lbm_inspired(checkpoint, device, src_path)
+    inference_config_path = frontend_config.get("inference_config_path")
+    runtime_device = frontend_config.get("device")
+    if runtime_device is None:
+        runtime_device = "cuda" if torch.cuda.is_available() else "cpu"
+    if inference_config_path:
+        inference_config_path = str(_resolve_frontend_relative(str(inference_config_path)))
+        pipeline = InferencePipeline.from_config(inference_config_path)
+        rans_checkpoint_dir = frontend_config.get("rans_checkpoint_dir", "<from-inference-config>")
     else:
-        raise KeyError(
-            "[Loader] checkpoint config 中找不到 'VAENCA' 或 'Model' 區段。\n"
-            f"現有 keys：{list(cfg.keys())}"
-        )
+        rans_checkpoint_dir = _resolve_rans_checkpoint_dir(frontend_config)
+        candidate_kwargs = {
+            "rans_checkpoint_dir": rans_checkpoint_dir,
+            "turb_checkpoint_dir": frontend_config.get("turb_checkpoint_dir"),
+            "turb_config_path": frontend_config.get("turb_config_path"),
+            "global_stats_path": frontend_config.get("global_stats_path"),
+            "device": runtime_device,
+            "nca_steps_per_cycle": frontend_config.get("nca_steps_per_cycle", 16),
+            "turb_nca_steps_per_macro": frontend_config.get("turb_nca_steps_per_macro", 8),
+            "turb_nca_steps_per_cycle": frontend_config.get("turb_nca_steps_per_macro", 8),
+            "max_iters": frontend_config.get("max_iters", 64),
+            "mae_tol": frontend_config.get("mae_tol", 1e-4),
+            "output_moments": frontend_config.get("output_moments", True),
+            "output_phy_fields": frontend_config.get("output_phy_fields", True),
+        }
+        supported_parameters = inspect.signature(InferencePipeline.__init__).parameters
+        pipeline_kwargs = {
+            key: value
+            for key, value in candidate_kwargs.items()
+            if key in supported_parameters and value is not None
+        }
+        pipeline = InferencePipeline(**pipeline_kwargs)
 
+    logger.info(
+        "[Loader] inference pipeline ready | backend_root=%s | rans_checkpoint_dir=%s",
+        backend_root,
+        rans_checkpoint_dir,
+    )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 舊版函式（向下相容，勿刪）
-# ─────────────────────────────────────────────────────────────────────────────
-
-def load_nca_model(checkpoint_path: str, nca_cfd_src: str = None):
-    """舊版 API，保留向下相容。回傳 (model, fake_cfg, static_ch)。"""
-    info     = load_model(checkpoint_path, nca_cfd_src)
-    fake_cfg = {"nca_channels": info["total_channels"]}
-    return info["model"], fake_cfg, info["static_channels"]
+    return PipelineInfo(
+        pipeline=pipeline,
+        backend_root=str(backend_root),
+        rans_checkpoint_dir=rans_checkpoint_dir,
+        inference_config_path=str(inference_config_path) if inference_config_path else None,
+    )
