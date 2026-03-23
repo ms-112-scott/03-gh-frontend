@@ -1,0 +1,9 @@
+numpy
+opencv-python
+matplotlib
+PyYAML
+taichi
+torch
+websockets
+websocket-client
+pathspec

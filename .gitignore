@@ -6,6 +6,7 @@ venv/
 .vscode/
 .idea/
 .DS_Store
+03-gh-frontend_code_base.txt
 
 # --- Rhino / Grasshopper 專用 ---
 # 備份檔案

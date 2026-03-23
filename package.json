@@ -7,7 +7,7 @@
   "type": "commonjs",
   "main": "index.js",
   "scripts": {
-    "start": "python ./src/main.py"
+    "start": ".\\.venv\\Scripts\\python.exe -m src.app.main"
   },
   "dependencies": {
     "ws": "^8.19.0"
